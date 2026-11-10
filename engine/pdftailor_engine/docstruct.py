@@ -156,7 +156,8 @@ def match_marker(text: str) -> tuple[str, str] | None:
     m = _BULLET_RE.match(text)
     if m:
         raw = m.group(0).rstrip()
-        return raw, "•"
+        # round bullets become Word's bullet; a ※ ■ □ ◆ ★ … is kept as written
+        return raw, ("•" if raw[:1] in "•·●◦‣⁃-–—*" else raw[:1])
     m = _NUM_RE.match(text)
     if m:
         raw = m.group(0).rstrip()

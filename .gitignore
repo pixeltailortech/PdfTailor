@@ -14,3 +14,12 @@ engine/build-engine-log.txt
 engine/*.spec
 
 _sync/
+
+_to_delete/
+*.zip
+# test samples contain personal data (name, salary): never push them
+範例/
+# build archives, a stray empty repo, and the 110 MB Tesseract copy (not decided yet)
+*.rar
+/PdfTailor/
+vendor/tesseract/

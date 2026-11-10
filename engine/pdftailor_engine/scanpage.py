@@ -2,7 +2,8 @@
 
 Pipeline, per page:
 
-1. the OCR engine finds and reads lines;
+1. the OCR engine finds and reads lines; a line that runs across a ruled table's cell
+   borders is cut at them, by the position of each word the engine reported;
 2. each line is measured from its pixels (em, baseline, ink colour, shapes);
 3. a line is cut apart at geometric symbols (■ □ ● …) and at wide gaps (table cells) — the
    symbols are classified by shape, the pieces between them are read again on their own,
@@ -15,7 +16,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import cv2
 import numpy as np
@@ -26,7 +27,9 @@ from .analysis.style import StyleEstimate, estimate_styles, regularize_sizes
 from .analysis.symbols import SymbolMatch
 from .geometry import Rect
 from .models import Block, Run, TextStyle
-from .ocr.base import OcrEngine, OcrLine
+from .ocr.base import OcrEngine, OcrLine, OcrWord
+from .ocr.tesseract import join_chars
+from .tables import Grid, erase_rules, find_grids
 
 _BLOCK_GAP_EM = 2.2  # a gap this wide starts a new block (table cells, columns)
 _SPACE_EM = 0.15  # a gap this wide between pieces reads as a space
@@ -43,6 +46,7 @@ class _Item:
     match: SymbolMatch | None = None
     text: str = ""
     conf: float = -1.0
+    keep: bool = False  # the page-pass reading stands; do not read this piece again
 
     @property
     def x0(self) -> int:
@@ -61,6 +65,147 @@ class _Item:
         return max(c.bottom for c in self.comps)
 
 
+# Characters an engine makes of a table's vertical rule, or of a cell edge it touches.
+_RULE_CHARS = set("|¦│┃｜[]_")
+
+
+def _vertical_rules(grids: list[Grid], scale: float) -> list[tuple[float, float, float]]:
+    """The vertical rules actually drawn in each table row, as (x, y0, y1) in page pixels.
+
+    Built from the separators, not from cells: where a rule is missing (a merged cell, or
+    a header band whose one rule only runs down part of it) nothing is cut.
+    """
+    out = []
+    for g in grids:
+        for r in range(g.rows):
+            for c in range(g.cols + 1):
+                if c == 0 or c == g.cols or g.vsep[r][c - 1]:
+                    out.append((g.xs[c] * scale, g.ys[r] * scale, g.ys[r + 1] * scale))
+    return out
+
+
+def _char_boxes(lines: list[OcrLine]) -> list[tuple[float, float, float, float]]:
+    """Boxes of the characters the engine read, for telling letter strokes from rules.
+    Rule characters are left out (they *are* the rules), and so are boxes far wider than
+    tall, which the engine sometimes stretches across a gap."""
+    out = []
+    for l in lines:
+        for w in l.words:
+            t = w.text.strip()
+            if not t or set(t) <= _RULE_CHARS or w.w > 1.6 * max(w.h, 1) * max(1, len(t)):
+                continue
+            out.append((w.x, w.y, w.x + w.w, w.y + w.h))
+    return out
+
+
+def _line_from_words(words: list[OcrWord], parent: OcrLine) -> OcrLine:
+    x0 = min(w.x for w in words)
+    x1 = max(w.x + w.w for w in words)
+    y0 = min(w.y for w in words)
+    y1 = max(w.y + w.h for w in words)
+    confs = [w.confidence for w in words if w.confidence >= 0]
+    return OcrLine(join_chars(words), x0, y0, x1 - x0, y1 - y0,
+                   sum(confs) / len(confs) if confs else -1.0, list(words))
+
+
+def _split_at_cells(lines: list[OcrLine], rules: list[tuple[float, float, float]]) -> list[OcrLine]:
+    """Cuts lines that run across table rules; drops the rules the engine read as text.
+
+    Page segmentation reads a table row as one line ("報到|110年11月15日|報到中國人壽…"),
+    so an edit, and the Word table, would mix cells. A line is cut between two neighbouring
+    characters wherever a drawn vertical rule passes between them; a "character" made only
+    of rule marks (| [ ] _) is the border itself.
+    """
+    out: list[OcrLine] = []
+    for l in lines:
+        if not l.words:
+            out.append(l)
+            continue
+        # reading order as the engine gave it: its character boxes overlap, so sorting them
+        # by position would swap neighbours (身分證 → 身證分)
+        words = [w for w in l.words if w.text.strip() and not set(w.text.strip()) <= _RULE_CHARS]
+        if not words:
+            continue
+        cy = l.y + l.h / 2
+        xs = sorted(x for x, y0, y1 in rules if y0 <= cy <= y1)
+        groups: list[list[OcrWord]] = [[words[0]]]
+        for a, b in zip(words, words[1:]):
+            ca, cb = a.x + a.w / 2, b.x + b.w / 2
+            if any(ca < x < cb for x in xs):
+                groups.append([b])
+            else:
+                groups[-1].append(b)
+        if len(groups) == 1 and len(words) == len(l.words):
+            out.append(l)
+        else:
+            out.extend(_line_from_words(g, l) for g in groups)
+    return out
+
+
+def _assign_words(ol: OcrLine, blocks: list[list[_Item]], scan: LineScan, x0: float) -> None:
+    """Gives every character the engine read in the page pass to the piece it overlaps most.
+
+    A text piece takes those characters as its reading (it may still be read again on its
+    own, see the caller). A symbol piece keeps its shape-detected character only where the
+    engine saw nothing better there: when the engine read a confident, ordinary character
+    at that spot, the "symbol" was the box-like part of a character (國, 回) and the
+    character stays.
+    """
+    k = scan.scale
+    items = [it for blk in blocks for it in blk]
+    spans = [(x0 + it.x0 / k, x0 + (it.x1 + 1) / k) for it in items]
+    got: list[list[OcrWord]] = [[] for _ in items]
+    for w in ol.words:
+        t = w.text.strip()
+        if not t or set(t) <= _RULE_CHARS:
+            continue
+        best, best_ov = -1, 0.0
+        for n, (a, b) in enumerate(spans):
+            ov = min(b, w.x + w.w) - max(a, w.x)
+            if items[n].kind == "sym":
+                ov *= 1.5  # a text piece's box can reach over the symbol next to it
+            if ov > best_ov:
+                best, best_ov = n, ov
+        if best < 0:  # between pieces: the nearest one
+            cx = w.x + w.w / 2
+            best = min(range(len(spans)), key=lambda n: min(abs(cx - spans[n][0]), abs(cx - spans[n][1])))
+        got[best].append(w)
+    for it, ws in zip(items, got):
+        if it.kind == "sym":
+            text = "".join(w.text.strip() for w in ws)
+            if ws and not any(ch in CONFUSABLE for ch in text) and min(w.confidence for w in ws) >= 70:
+                it.kind, it.match = "txt", None
+                it.text = join_chars(ws)
+                it.conf = sum(w.confidence for w in ws) / len(ws)
+                it.keep = True
+            continue
+        if ws:
+            it.text = join_chars(ws)
+            confs = [w.confidence for w in ws if w.confidence >= 0]
+            it.conf = sum(confs) / len(confs) if confs else -1.0
+
+
+def _width_misfit(text: str, width_em: float) -> float:
+    """How far a reading's expected width (CJK 1 em, others about half) is from the ink's."""
+    est = sum(1.0 if _is_cjk(ch) else 0.55 for ch in text if not ch.isspace())
+    return abs(est - width_em) / max(width_em, 0.5)
+
+
+def _similar(a: str, b: str) -> float:
+    """0..1, share of characters two readings have in common (order-aware)."""
+    a = "".join(a.split())
+    b = "".join(b.split())
+    if not a or not b:
+        return 0.0
+    prev = [0] * (len(b) + 1)
+    for ca in a:
+        cur = [0]
+        for j, cb in enumerate(b):
+            cur.append(prev[j] + 1 if ca == cb else max(prev[j + 1], cur[j]))
+        prev = cur
+    return 2 * prev[-1] / (len(a) + len(b))
+
+
 @dataclass
 class ScanResult:
     blocks: list[Block]
@@ -73,6 +218,11 @@ def _split_into_blocks(scan: LineScan) -> list[list[_Item]]:
     items: list[_Item] = []
     right = -1e9
     for c in scan.comps:  # sorted left to right
+        if c.w >= 3 * scan.em:
+            # no letter is 3 em wide: an underline or a rule (with whatever strokes touch it);
+            # the text it carries is still text, so it does not open a gap either
+            right = max(right, c.right)
+            continue
         if items and c.x - right >= _BLOCK_GAP_EM * scan.em:
             blocks.append(items)
             items = []
@@ -199,7 +349,9 @@ def _dedupe(lines: list[OcrLine]) -> list[OcrLine]:
         for k in keep:
             ix = min(l.x + l.w, k.x + k.w) - max(l.x, k.x)
             iy = min(l.y + l.h, k.y + k.h) - max(l.y, k.y)
-            if ix > 0 and iy > 0 and ix * iy >= 0.5 * min(l.w * l.h, k.w * k.h):
+            # the same ink read twice: they overlap in area *and* share most of their
+            # height (a title's tall box, logo included, can reach over the small line under it)
+            if ix > 0 and iy > 0 and ix * iy >= 0.5 * min(l.w * l.h, k.w * k.h) and iy >= 0.6 * max(l.h, k.h):
                 dup = True
                 break
         if not dup:
@@ -291,12 +443,18 @@ def analyze_scanned_page(
     engine: OcrEngine,
     page_number: int,
     workers: int | None = None,
+    grids: list[Grid] | None = None,
 ) -> ScanResult:
     """``rgb`` is the page render, ``scale`` its pixels per point."""
     H, W = rgb.shape[:2]
     notes: list[str] = []
     engine.dpi = scale * 72.0
-    ocr_lines = _dedupe([l for l in engine.recognize_page(rgb) if l.text.strip()])
+    page_lines = [l for l in engine.recognize_page(rgb) if l.text.strip()]
+    if grids is None:
+        grids = find_grids(rgb, scale, _char_boxes(page_lines))
+    ocr_lines = _split_at_cells(page_lines, _vertical_rules(grids, scale))
+    rgb = erase_rules(rgb, grids, scale)  # lines are measured and re-read without the table's rules
+    ocr_lines = _dedupe([l for l in ocr_lines if l.text.strip()])
     # A short, unsure line is often a fragment of a word the layout pass cut up (half of
     # 品名 read as 於). It must not hide that ink from the orphan search; it survives only
     # if nothing better is found where it is.
@@ -347,19 +505,37 @@ def analyze_scanned_page(
                 reread.append((li, ol, _prepare_crop(np.ascontiguousarray(rgb[y0 : y0 + int(scan.rgb.shape[0] / scan.scale) + 1, x0 : x0 + int(scan.rgb.shape[1] / scan.scale) + 1]), scan.em / scan.scale, scan.bg)))
             continue
         plans.append(blocks)
+        if ol.words:
+            _assign_words(ol, blocks, scan, x0)
         for blk in blocks:
             for it in blk:
-                if it.kind != "txt":
+                if it.kind != "txt" or it.keep:
                     continue
                 jobs.append((li, it, _text_crop(scan, it)))
 
     if jobs:
         def run(job):
-            _, it, crop = job
+            li, it, crop = job
+            had = it.text if it.text else None
+            sc = prepared[li][1]
+            width_em = (it.x1 - it.x0) / max(sc.em, 1e-6)
             try:
-                it.text, it.conf = engine.recognize_crop(crop)
+                text, conf = engine.recognize_crop(crop)
             except Exception:  # one bad crop must not sink the page
-                it.text, it.conf = "", -1.0
+                text, conf = "", -1.0
+            if had is None:
+                it.text, it.conf = text, conf
+                return
+            if not (text.strip() and _plausible(text)):
+                return
+            # Take the separate reading when the engine is clearly surer of it and it is a
+            # correction of the same text — or, when the two disagree outright, when only it
+            # fits the width of the ink (Tesseract read two bold 數量 as "Ae", sure of it).
+            if _similar(text, had) >= 0.5:
+                if conf >= it.conf + 10:
+                    it.text, it.conf = text, conf
+            elif conf >= 60 and _width_misfit(text, width_em) < 0.5 * _width_misfit(had, width_em):
+                it.text, it.conf = text, conf
 
         with ThreadPoolExecutor(max_workers=workers or min(4, os.cpu_count() or 2)) as pool:
             list(pool.map(run, jobs))
@@ -373,7 +549,8 @@ def analyze_scanned_page(
                 return
             # The line on its own, at a comfortable size, usually reads better than in the
             # page layout; take it only when the engine is clearly surer of it.
-            if text.strip() and conf > ol.confidence + (1 if len(ol.text.strip()) <= 4 else 5) and _plausible(text):
+            if (text.strip() and conf > ol.confidence + (1 if len(ol.text.strip()) <= 4 else 5) and _plausible(text)
+                    and (len(ol.text.strip()) <= 4 or _similar(text, ol.text) >= 0.5)):
                 prepared[li] = (OcrLine(text.strip(), ol.x, ol.y, ol.w, ol.h, conf),) + prepared[li][1:]
 
         with ThreadPoolExecutor(max_workers=workers or min(4, os.cpu_count() or 2)) as pool:
@@ -387,9 +564,21 @@ def analyze_scanned_page(
         def to_page(cx: float, cy: float) -> tuple[float, float]:
             return x0 + cx / k, y0 + cy / k
 
-        def block_rect(items: list[_Item]) -> Rect:
-            px0, py0 = to_page(min(it.x0 for it in items), min(it.y0 for it in items))
-            px1, py1 = to_page(max(it.x1 for it in items), max(it.y1 for it in items))
+        def block_rect(items: list[_Item], ol=ol, k=k, y0=y0) -> Rect:
+            # The crop has a margin, so it can hold the bottom of the line above or the top
+            # of the one below; only ink centred in this line's band sets its height (a
+            # block 2.5 lines tall made Word merge it with its neighbours).
+            if ol.words:  # character boxes can be reported too tall; the typical one is not
+                top = float(np.median([w.y for w in ol.words]))
+                bot = float(np.median([w.y + w.h for w in ol.words]))
+            else:
+                top, bot = ol.y, ol.y + ol.h
+            hh = max(bot - top, 1.0)
+            lo = (top - 0.3 * hh - y0) * k
+            hi = (bot + 0.3 * hh - y0) * k
+            comps = [c for it in items for c in it.comps if lo <= (c.y + c.bottom) / 2 <= hi] or [c for it in items for c in it.comps]
+            px0, py0 = to_page(min(it.x0 for it in items), min(c.y for c in comps))
+            px1, py1 = to_page(max(it.x1 for it in items), max(c.bottom for c in comps))
             return Rect.from_bounds(px0 / scale, py0 / scale, px1 / scale, py1 / scale)
 
         em_pt = size_px / scale
@@ -457,7 +646,95 @@ def analyze_scanned_page(
     if any(b.detected_symbols for b in out):
         n = sum(len(b.detected_symbols) for b in out)
         notes.append(f"以形狀偵測補回 {n} 個符號（■□●「」等），OCR 引擎本身常讀錯這類字元。")
+    out = _harmonize_markers(out)
+    out = [_with_text(b, cjk_punctuation(b.text)) for b in out]
     return ScanResult(out, notes)
+
+
+_FULLWIDTH = {",": "，", ":": "：", ";": "；", "!": "！", "?": "？"}
+
+
+def cjk_punctuation(text: str) -> str:
+    """Comma, colon, semicolon, ! and ? beside Chinese are the full-width forms.
+
+    Tesseract returns the ASCII forms with a space ("台端至本公司服務, 錄用"), which changes
+    how the line looks once written back. A mark between two digits ("2,400") stays.
+    """
+    chars = list(text)
+    out: list[str] = []
+    n = len(chars)
+    i = 0
+    while i < n:
+        ch = chars[i]
+        if ch in _FULLWIDTH:
+            j = len(out) - 1
+            while j >= 0 and out[j] == " ":
+                j -= 1
+            prev = out[j] if j >= 0 else ""
+            k = i + 1
+            while k < n and chars[k] == " ":
+                k += 1
+            nxt = chars[k] if k < n else ""
+            digits = prev.isdigit() and nxt.isdigit()
+            if not digits and (_is_cjk(prev) or _is_cjk(nxt)) and not (prev in "）)" and nxt.isascii() and nxt.isalnum()):
+                del out[j + 1:]
+                out.append(_FULLWIDTH[ch])
+                i = k
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+# What the engine makes of a ※ at the start of a list line.
+_MARKER_MISREADS = ("HK", "PK", "K", "*", "了", "米", "X", "x", "%", "際", "“", "”", '"')
+
+
+def _with_text(b: Block, text: str) -> Block:
+    if text == b.text:
+        return b
+    runs = [Run(text, b.runs[0].style if b.runs else b.style, b.bounds.x, b.bounds.right)]
+    return replace(b, text=text, runs=runs)
+
+
+def _harmonize_markers(blocks: list[Block]) -> list[Block]:
+    """List lines in one column share their marker. When most lines starting at the same
+    x begin with ※, a line there that begins with something ※ is often misread as (K, HK,
+    *, 了) gets the ※ back, and a lone one-character block sitting in the marker column
+    right before a line's text is that line's marker."""
+    if len(blocks) < 3:
+        return blocks
+    out = list(blocks)
+    starts = [b for b in out if b.text.startswith("※")]
+    if len(starts) < 3:
+        return out
+    col_x = sorted(b.bounds.x for b in starts)[len(starts) // 2]
+    em = sorted(b.style.size for b in starts)[len(starts) // 2]
+    in_col = lambda b: abs(b.bounds.x - col_x) <= 0.6 * em  # noqa: E731
+    drop: set[int] = set()
+    for i, b in enumerate(out):
+        if not in_col(b) or b.text.startswith("※"):
+            continue
+        t = b.text
+        for bad in _MARKER_MISREADS:
+            if t.startswith(bad) and len(t) > len(bad) and (_is_cjk(t[len(bad)]) or t[len(bad)] == "※"):
+                rest = t[len(bad):].lstrip()
+                out[i] = _with_text(b, rest if rest.startswith("※") else "※" + rest)
+                break
+        else:
+            if len(t.strip()) == 1:
+                # a lone mark in the column: the marker of the text right of it on the same row
+                for j, o in enumerate(out):
+                    if j == i or j in drop:
+                        continue
+                    ov = min(b.bounds.bottom, o.bounds.bottom) - max(b.bounds.y, o.bounds.y)
+                    gap = o.bounds.x - b.bounds.right
+                    if ov > 0.3 * min(b.bounds.h, o.bounds.h) and 0 <= gap <= 1.5 * em and not o.text.startswith("※"):
+                        out[j] = replace(_with_text(o, "※" + o.text),
+                                         bounds=Rect.from_bounds(b.bounds.x, min(b.bounds.y, o.bounds.y), o.bounds.right, max(b.bounds.bottom, o.bounds.bottom)))
+                        drop.add(i)
+                        break
+    return [b for i, b in enumerate(out) if i not in drop]
 
 
 def _make_block(

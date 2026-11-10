@@ -11,7 +11,18 @@ analysis code depends only on this interface. Two things are asked of an engine:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+@dataclass
+class OcrWord:
+    text: str
+    x: float  # pixels of the image that was recognised
+    y: float
+    w: float
+    h: float
+    confidence: float  # 0..100; -1 when unknown
+    start: bool = True  # begins a word (engines may report single characters)
 
 
 @dataclass
@@ -22,6 +33,10 @@ class OcrLine:
     w: float
     h: float
     confidence: float  # 0..100, mean over words; -1 when unknown
+    # Where each word of ``text`` sits, when the engine reports it. Lets the analyser cut a
+    # line at table rules and wide gaps by position, keeping the engine's own reading of
+    # every piece instead of reading the pieces again out of context.
+    words: list[OcrWord] = field(default_factory=list)
 
 
 class OcrUnavailable(Exception):

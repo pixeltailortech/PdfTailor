@@ -33,13 +33,25 @@
         </ScrollViewer>
 
         <Border Grid.Row="2" Background="#0F1724" BorderBrush="#1E2B40" BorderThickness="0,1,0,0" Padding="20,12">
-            <DockPanel>
-                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
-                    <Button Content="返回修改" Style="{StaticResource GhostButton}" Click="OnBack" Padding="18,10"/>
-                    <Button Content="確定輸出" Style="{StaticResource PrimaryButton}" Click="OnConfirm" Margin="10,0,0,0"/>
-                </StackPanel>
-                <TextBlock x:Name="NotesText" Foreground="#F5D48A" FontSize="12" TextWrapping="Wrap" VerticalAlignment="Center" Margin="0,0,20,0"/>
-            </DockPanel>
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <TextBlock x:Name="NotesText" Grid.Row="0" Foreground="#F5D48A" FontSize="12" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                <DockPanel Grid.Row="1">
+                    <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                        <Button Content="返回修改" Style="{StaticResource GhostButton}" Click="OnBack" Padding="18,10"/>
+                        <Button Content="確定輸出" Style="{StaticResource PrimaryButton}" Click="OnConfirm" Margin="10,0,0,0"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <CheckBox x:Name="AuditBox" Content="同時產生修改紀錄（建議）" IsChecked="True" Checked="OnAuditChanged" Unchecked="OnAuditChanged"
+                                  ToolTip="在輸出檔旁邊寫 .audit.json 與 .audit.csv：誰、何時、改了什麼，以及原始檔的雜湊值"/>
+                        <CheckBox x:Name="AuditTextBox" Content="紀錄中包含文字內容" IsChecked="True" Margin="24,0,0,0"
+                                  ToolTip="取消勾選時，紀錄只留字數，不含原文與新文（紀錄可能含客戶資料）"/>
+                    </StackPanel>
+                </DockPanel>
+            </Grid>
         </Border>
     </Grid>
 </Window>

@@ -10,13 +10,14 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from html.parser import HTMLParser
 import sys
 import tempfile
 
 import numpy as np
 from PIL import Image
 
-from .base import OcrEngine, OcrLine, OcrUnavailable
+from .base import OcrEngine, OcrLine, OcrUnavailable, OcrWord
 
 _WIN_PATHS = (
     r"C:\Program Files\Tesseract-OCR\tesseract.exe",
@@ -138,15 +139,15 @@ class TesseractOcr(OcrEngine):
         with tempfile.TemporaryDirectory(prefix="pt-ocr-") as tmp:
             img = os.path.join(tmp, "p.png")
             self._save(rgb, img)
-            tsv = self._run([img, "stdout", "-l", self.languages, "--psm", str(psm), "--dpi", str(int(round(self.dpi))), "tsv"])
-        return self._parse_lines(tsv)
+            hocr = self._run([img, "stdout", "-l", self.languages, "--psm", str(psm), "--dpi", str(int(round(self.dpi))), "-c", "tessedit_create_hocr=1", "-c", "tessedit_create_txt=0", "-c", "hocr_char_boxes=1"])
+        return self._parse_lines(hocr)
 
     def recognize_crop(self, rgb: np.ndarray) -> tuple[str, float]:
         with tempfile.TemporaryDirectory(prefix="pt-ocr-") as tmp:
             img = os.path.join(tmp, "c.png")
             self._save(rgb, img)
-            tsv = self._run([img, "stdout", "-l", self.languages, "--psm", "7", "--dpi", str(int(round(self.dpi))), "tsv"])
-        lines = self._parse_lines(tsv)
+            hocr = self._run([img, "stdout", "-l", self.languages, "--psm", "7", "--dpi", str(int(round(self.dpi))), "-c", "tessedit_create_hocr=1", "-c", "tessedit_create_txt=0", "-c", "hocr_char_boxes=1"])
+        lines = self._parse_lines(hocr)
         if not lines:
             return "", -1.0
         text = join_words([l.text for l in lines]) if len(lines) > 1 else lines[0].text
@@ -154,33 +155,138 @@ class TesseractOcr(OcrEngine):
         return text, (sum(confs) / len(confs) if confs else -1.0)
 
     @staticmethod
-    def _parse_lines(tsv: str) -> list[OcrLine]:
-        words: dict[tuple[int, int, int], list[tuple[str, float, int, int, int, int]]] = {}
-        for raw in tsv.splitlines()[1:]:
-            parts = raw.split("\t", 11)
-            if len(parts) < 12 or parts[0] != "5":
-                continue
-            text = parts[11].strip()
-            if not text:
-                continue
-            try:
-                key = (int(parts[2]), int(parts[3]), int(parts[4]))
-                left, top, width, height = (int(parts[i]) for i in (6, 7, 8, 9))
-                conf = float(parts[10])
-            except ValueError:
-                continue
-            words.setdefault(key, []).append((text, conf, left, top, width, height))
+    def _parse_lines(hocr: str) -> list[OcrLine]:
+        """Lines from Tesseract's hOCR, with a box per character (``hocr_char_boxes``).
 
+        The character boxes let the analyser cut a line at a table rule or a symbol and keep
+        the engine's reading of each piece. Tesseract's LSTM boxes are approximate (a
+        character can be reported a little wide), which is enough to tell cells apart.
+        """
+        p = _HocrParser()
+        p.feed(hocr)
+        p.close()
         lines: list[OcrLine] = []
-        for key in sorted(words):
-            ws = sorted(words[key], key=lambda w: w[2])
-            text = join_words([w[0] for w in ws])
+        for chars, box in zip(p.lines, p.boxes):
+            chars = [c for c in chars if c.text.strip()]
+            if not chars:
+                continue
+            # The LSTM sometimes reports one character as wide as the next several
+            # (中 868–1190 px while 國 starts at 986). Its left edge is right, so the box is
+            # cut to a character's usual width; otherwise it would land in the wrong piece
+            # when the line is cut apart.
+            hmed = float(np.median([c.h for c in chars]))
+            for c in chars:
+                limit = 1.3 * hmed * max(1, len(c.text.strip()))
+                if c.w > limit:
+                    c.w = limit
+            text = join_chars(chars)
             if not text:
                 continue
-            x0 = min(w[2] for w in ws)
-            y0 = min(w[3] for w in ws)
-            x1 = max(w[2] + w[4] for w in ws)
-            y1 = max(w[3] + w[5] for w in ws)
-            confs = [w[1] for w in ws if w[1] >= 0]
-            lines.append(OcrLine(text, x0, y0, x1 - x0, y1 - y0, sum(confs) / len(confs) if confs else -1.0))
+            x0 = min(c.x for c in chars)
+            x1 = max(c.x + c.w for c in chars)
+            y0 = min(c.y for c in chars)
+            y1 = max(c.y + c.h for c in chars)
+            confs = [c.confidence for c in chars if c.confidence >= 0]
+            lines.append(OcrLine(text, x0, y0, x1 - x0, y1 - y0, sum(confs) / len(confs) if confs else -1.0, chars))
         return lines
+
+
+def join_chars(chars: list[OcrWord]) -> str:
+    """Joins characters back into text: a space only where a new word starts between two
+    Latin-ish neighbours (Tesseract's spaces between Chinese characters are artefacts)."""
+    out = ""
+    for c in chars:
+        t = c.text.strip()
+        if not t:
+            continue
+        if out and c.start and not (_is_cjk(out[-1]) or _is_cjk(t[0])):
+            out += " "
+        out += t
+    return out
+
+
+def _bbox(title: str, key: str) -> tuple[int, int, int, int] | None:
+    for part in title.split(";"):
+        part = part.strip()
+        if part.startswith(key + " "):
+            try:
+                a, b, c, d = (int(v) for v in part[len(key) + 1:].split()[:4])
+            except ValueError:
+                return None
+            return a, b, c, d
+    return None
+
+
+def _num(title: str, key: str) -> float:
+    for part in title.split(";"):
+        part = part.strip()
+        if part.startswith(key + " "):
+            try:
+                return float(part[len(key) + 1:].split()[0])
+            except (ValueError, IndexError):
+                return -1.0
+    return -1.0
+
+
+class _HocrParser(HTMLParser):
+    """Collects ocr_line → ocrx_word → ocrx_cinfo into per-line character lists."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.lines: list[list[OcrWord]] = []
+        self.boxes: list[tuple[int, int, int, int] | None] = []  # each line's own bbox
+        self._stack: list[str] = []  # class of every open span
+        self._word: tuple[tuple[int, int, int, int], float] | None = None
+        self._word_has_chars = False
+        self._word_text = ""
+        self._char: tuple[tuple[int, int, int, int], float] | None = None
+        self._char_text = ""
+        self._first = True
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "span":
+            return
+        a = dict(attrs)
+        cls = a.get("class", "")
+        title = a.get("title", "")
+        self._stack.append(cls)
+        if cls in ("ocr_line", "ocr_textfloat", "ocr_header", "ocr_caption"):
+            self.lines.append([])
+            self.boxes.append(_bbox(title, "bbox"))
+        elif cls == "ocrx_word":
+            box = _bbox(title, "bbox")
+            self._word = (box, _num(title, "x_wconf")) if box else None
+            self._word_has_chars = False
+            self._word_text = ""
+            self._first = True
+        elif cls == "ocrx_cinfo":
+            box = _bbox(title, "x_bboxes")
+            self._char = (box, _num(title, "x_conf")) if box else None
+            self._char_text = ""
+            self._word_has_chars = True
+
+    def handle_data(self, data):
+        if not self._stack:
+            return
+        if self._stack[-1] == "ocrx_cinfo":
+            self._char_text += data
+        elif self._stack[-1] == "ocrx_word":
+            self._word_text += data
+
+    def handle_endtag(self, tag):
+        if tag != "span" or not self._stack:
+            return
+        cls = self._stack.pop()
+        if not self.lines:
+            return
+        if cls == "ocrx_cinfo" and self._char is not None:
+            (x0, y0, x1, y1), conf = self._char
+            if self._char_text:
+                self.lines[-1].append(OcrWord(self._char_text, x0, y0, x1 - x0, y1 - y0, conf, self._first))
+                self._first = False
+            self._char = None
+        elif cls == "ocrx_word" and self._word is not None:
+            if not self._word_has_chars and self._word_text.strip():
+                (x0, y0, x1, y1), conf = self._word
+                self.lines[-1].append(OcrWord(self._word_text.strip(), x0, y0, x1 - x0, y1 - y0, conf, True))
+            self._word = None

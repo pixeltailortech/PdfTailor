@@ -84,6 +84,17 @@ public partial class PreviewWindow : Window
         }
     }
 
+    /// <summary>Write the .audit.json / .audit.csv next to the output (default on, not remembered).</summary>
+    public bool MakeAudit => AuditBox.IsChecked == true;
+    /// <summary>Keep the original and new text in the record; off = only character counts.</summary>
+    public bool AuditIncludeText => AuditTextBox.IsChecked == true;
+
+    private void OnAuditChanged(object sender, RoutedEventArgs e)
+    {
+        if (AuditTextBox == null) return;   // fired while the XAML is still loading
+        AuditTextBox.IsEnabled = AuditBox.IsChecked == true;
+    }
+
     private void OnConfirm(object sender, RoutedEventArgs e) => DialogResult = true;
     private void OnBack(object sender, RoutedEventArgs e) => DialogResult = false;
 

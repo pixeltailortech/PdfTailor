@@ -41,6 +41,7 @@ public partial class MainWindow : Window
         InitializeComponent();
         InitNavAndMerge();
         InitWord();
+        InitPages();
         foreach (var s in Symbols)
         {
             var b = new Button { Content = s, Style = (Style)FindResource("ChipButton"), ToolTip = "插入 " + s };
@@ -169,6 +170,13 @@ public partial class MainWindow : Window
         });
         if (_path != null) await GoTo(1);
         UpdateWordView();
+        if (_path != null && _pagesFor != _path)
+        {
+            // a different file: the page organiser's thumbnails belong to the old one
+            _pages.Clear(); _thumbCache.Clear(); _pagesFor = null;
+            UpdatePagesView();
+            if (_mode == Mode.Pages) await LoadPagesAsync();
+        }
     }
 
     // ================================================================ pages
@@ -530,6 +538,15 @@ public partial class MainWindow : Window
             else if (e.Key == Key.Escape && _busy) { _cts?.Cancel(); e.Handled = true; }
             return;
         }
+        if (_mode == Mode.Pages)
+        {
+            bool typing = Keyboard.FocusedElement is TextBox;
+            if (ctrl && e.Key == Key.O) { e.Handled = true; OnOpen(sender, e); }
+            else if (e.Key == Key.Escape && _busy) { _cts?.Cancel(); e.Handled = true; }
+            else if (!typing && !_busy && e.Key == Key.Delete) { e.Handled = true; DeleteSelectedPages(); }
+            else if (!typing && !_busy && ctrl && e.Key == Key.A) { e.Handled = true; PagesList.SelectAll(); }
+            return;
+        }
         if (_mode == Mode.Merge)
         {
             if (ctrl && e.Key == Key.O) { e.Handled = true; PickMergeFiles(); }
@@ -595,6 +612,7 @@ public partial class MainWindow : Window
 
         var preview = new PreviewWindow(pages, notes, n) { Owner = this };
         if (preview.ShowDialog() != true) { SetStatus("已返回編輯。"); return; }
+        bool makeAudit = preview.MakeAudit, auditText = preview.AuditIncludeText;
 
         var save = new SaveFileDialog
         {
@@ -609,13 +627,17 @@ public partial class MainWindow : Window
         JsonObject? result = null;
         await Run("輸出中…", async ct =>
         {
-            result = (await _engine.CallAsync("export", new JsonObject { ["edits"] = edits.DeepClone(), ["out"] = outPath, ["verify"] = true }, ct))!.AsObject();
+            result = (await _engine.CallAsync("export", new JsonObject
+            {
+                ["edits"] = edits.DeepClone(), ["out"] = outPath, ["verify"] = true,
+                ["audit"] = makeAudit, ["auditText"] = auditText,
+            }, ct))!.AsObject();
         });
         if (result == null) return;
         _exported = true;
         bool ok = result["verify"]?["ok"]?.GetValue<bool>() ?? true;
         SetStatus($"已輸出：{outPath}");
-        new DoneDialog(outPath, n, ok) { Owner = this }.ShowDialog();
+        new DoneDialog(outPath, n, ok, result["audit"]?["json"]?.GetValue<string>(), result["auditError"]?.GetValue<string>()) { Owner = this }.ShowDialog();
     }
 
     private static List<string> DescribeNotes(JsonArray? notes)
@@ -689,7 +711,7 @@ public partial class MainWindow : Window
         Progress.IsIndeterminate = false;
         Progress.Value = f;
         if (Stages.TryGetValue(stage, out var s)) SetStatus($"{s}…（Esc 取消）");
-        else if (stage.StartsWith("頁 ")) SetStatus($"轉換第 {stage[2..]} 頁…（Esc 取消）");
+        else if (stage.StartsWith("頁 ")) SetStatus(_mode == Mode.Pages ? $"載入縮圖：第 {stage[2..]} 頁…（Esc 取消）" : $"轉換第 {stage[2..]} 頁…（Esc 取消）");
         else if (stage == "寫入 Word") SetStatus("寫入 Word 檔…");
     }
 

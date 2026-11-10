@@ -9,6 +9,7 @@ namespace PdfTailor.Services;
 public sealed class MergeItem : INotifyPropertyChanged
 {
     private int _order;
+    private int _rotation;
 
     public MergeItem(string path, int pages)
     {
@@ -24,6 +25,22 @@ public sealed class MergeItem : INotifyPropertyChanged
     public int Pages { get; }
     public string PagesLabel => $"{Pages} 頁";
     public string SizeLabel { get; }
+
+    /// <summary>Clockwise turn applied to every page of this file when merging: 0, 90, 180 or 270.</summary>
+    public int Rotation
+    {
+        get => _rotation;
+        set
+        {
+            int v = ((value % 360) + 360) % 360;
+            if (_rotation == v) return;
+            _rotation = v;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Rotation)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(RotationLabel)));
+        }
+    }
+
+    public string RotationLabel => _rotation == 0 ? "" : $"↻ {_rotation}°";
 
     public int Order
     {
@@ -58,8 +75,11 @@ public sealed class PdfMergeService
         return doc.PageCount;
     }
 
+    /// <param name="rotations">Clockwise degrees per input (same order), added to each page's own
+    /// rotation. Only the /Rotate entry changes: page content is copied as it is.</param>
     public Task MergeAsync(IReadOnlyList<string> inputPaths, string outputPath,
-        IProgress<string>? progress = null, CancellationToken cancellationToken = default)
+        IProgress<string>? progress = null, CancellationToken cancellationToken = default,
+        IReadOnlyList<int>? rotations = null)
         => Task.Run(() =>
         {
             if (inputPaths.Count < 2)
@@ -81,8 +101,13 @@ public sealed class PdfMergeService
                         var inputPath = inputPaths[index];
                         progress?.Report($"正在合併 {index + 1} / {inputPaths.Count}：{System.IO.Path.GetFileName(inputPath)}（Esc 取消）");
                         using var input = PdfReader.Open(inputPath, PdfDocumentOpenMode.Import);
+                        int turn = rotations != null && index < rotations.Count ? rotations[index] : 0;
                         for (var page = 0; page < input.PageCount; page++)
-                            output.AddPage(input.Pages[page]);
+                        {
+                            var added = output.AddPage(input.Pages[page]);
+                            if (turn % 360 != 0)
+                                added.Rotate = (((added.Rotate + turn) % 360) + 360) % 360;
+                        }
                     }
                     cancellationToken.ThrowIfCancellationRequested();
                     output.Save(tmp);

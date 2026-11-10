@@ -22,10 +22,12 @@ from typing import Any, Callable
 import numpy as np
 
 from .analysis.imaging import ink_mask
+from .audit import build_arrange_audit, build_edit_audit, sha256_file, write_audit
 from .fontmatch import MIN_MARGIN, match_font
 from .fonts import FontIndex, default_index, is_cjk
 from .geometry import Rect
 from .models import Block, Edit, Run
+from .pageops import PlanError, arrange as _arrange_pages, validate_plan
 from .ocr.base import OcrEngine, OcrLine, OcrUnavailable, ExternalOcr
 from .ocr.tesseract import TesseractOcr, find_tesseract
 from .pdfio import PdfDoc
@@ -64,6 +66,7 @@ class Session:
     def __init__(self, fonts: FontIndex | None = None, workdir: str | None = None):
         self._fonts = fonts
         self.workdir = workdir or tempfile.mkdtemp(prefix="pdftailor-")
+        os.makedirs(self.workdir, exist_ok=True)
         self.doc: PdfDoc | None = None
         self.blocks: dict[int, list[Block]] = {}
         self._lock = threading.RLock()
@@ -225,6 +228,44 @@ class Session:
             b.style = style
             for run in b.runs:
                 run.style = style
+        self._settle_sizes(blocks)
+
+    @staticmethod
+    def _settle_sizes(blocks: list[Block]) -> None:
+        """Steadies the sizes of scanned lines.
+
+        Glyph matching sizes each line on its own and scatters one 10.5 pt list over 9–12 pt,
+        which shows at once in the Word file. Chinese characters advance one em each, so a
+        line of them gives its size from its length; that is used when it agrees roughly
+        with the glyph size (far smaller glyphs mean spaced-out text, where the length says
+        nothing). Then sizes that are close are pulled onto the sizes the page actually uses.
+        """
+        import unicodedata
+
+        from .analysis.style import regularize_sizes
+
+        sizes: list[float] = []
+        reliable: list[bool] = []
+        for b in blocks:
+            t = b.text.strip()
+            wide = sum(1 for ch in t if unicodedata.east_asian_width(ch) in "WF")
+            size = b.style.size
+            ok = False
+            if wide >= 6 and wide >= 0.6 * len(t.replace(" ", "")):
+                ems = sum(0.3 if ch.isspace() else (1.0 if unicodedata.east_asian_width(ch) in "WF" else 0.55) for ch in t)
+                pitch = b.bounds.w / ems
+                if 0.85 * pitch <= size <= 1.25 * pitch:
+                    size, ok = pitch, True
+            sizes.append(size)
+            reliable.append(ok)
+        sizes = regularize_sizes(sizes, reliable, pull_reliable=0.08, pull_unreliable=0.15)
+        for b, sz in zip(blocks, sizes):
+            if abs(sz - b.style.size) < 0.01:
+                continue
+            style = b.style.with_(size=snap_size(sz))
+            b.style = style
+            for run in b.runs:
+                run.style = style
 
     # ---- preview / export -----------------------------------------------------------
     def _edits(self, edits: list[dict]) -> list[Edit]:
@@ -247,16 +288,80 @@ class Session:
             out.close()
         return {"pdf": pdf_path, "images": images, "report": report.to_json()}
 
-    def export(self, edits: list[dict], out_path: str, verify: bool = True) -> dict[str, Any]:
+    def export(
+        self,
+        edits: list[dict],
+        out_path: str,
+        verify: bool = True,
+        audit: bool = True,
+        audit_text: bool = True,
+    ) -> dict[str, Any]:
         doc = self._need_doc()
         out_path = os.path.abspath(out_path)
         if os.path.normcase(out_path) == os.path.normcase(doc.path):
             raise EngineError("不能覆蓋原始檔，請另存新檔。")
         es = self._edits(edits)
+        src_sha = sha256_file(doc.path) if audit else None
         report = write_edits(doc.path, es, out_path, fonts=self.fonts, doc=doc)
         result = {"report": report.to_json()}
         if verify:
             result["verify"] = verify_output(doc, out_path, es, report.pages_changed)
+        if audit:
+            # The PDF is already written; a record that fails must not turn that into an
+            # error. The shell shows the failure as a warning instead.
+            try:
+                rec = build_edit_audit(doc, out_path, es, result.get("verify"), audit_text, src_sha)
+                result["audit"] = write_audit(rec, out_path)
+            except Exception as ex:
+                result["auditError"] = f"{type(ex).__name__}: {ex}"
+        return result
+
+    # ---- page organiser -------------------------------------------------------------
+    def thumbnails(self, pages: list[int] | None = None, dpi: float = 36, progress: Progress | None = None) -> dict[str, Any]:
+        doc = self._need_doc()
+        want = list(pages) if pages else list(range(1, doc.page_count + 1))
+        bad = [p for p in want if not 1 <= int(p) <= doc.page_count]
+        if bad:
+            raise EngineError(f"頁碼超出範圍：{bad[0]}")
+        dpi = min(max(float(dpi), 12.0), 144.0)
+        images = []
+        for i, p in enumerate(want):
+            if progress is not None and progress(f"頁 {p}", i / len(want)) is False:
+                raise Cancelled()
+            path = self._tmp(f"thumb{p}", ".png")
+            w, h = doc.render_png(int(p), dpi / 72.0, path)
+            images.append({"page": int(p), "path": path, "width": w, "height": h, "dpi": dpi})
+        if progress is not None:
+            progress("done", 1.0)
+        return {"images": images}
+
+    def arrange(self, plan: list[dict], out_path: str, audit: bool = True) -> dict[str, Any]:
+        """Writes a new PDF with the planned pages (order = plan order, pages not in the
+        plan are deleted, ``rotate`` is extra clockwise degrees). Works on the original
+        file, not on text edits that have not been exported yet."""
+        doc = self._need_doc()
+        out_path = os.path.abspath(out_path)
+        if os.path.normcase(out_path) == os.path.normcase(doc.path):
+            raise EngineError("不能覆蓋原始檔，請另存新檔。")
+        try:
+            steps = validate_plan(plan, doc.page_count)
+            src_sha = sha256_file(doc.path) if audit else None
+            info = _arrange_pages(doc.path, plan, out_path)
+        except PlanError as ex:
+            raise EngineError(str(ex)) from None
+        result: dict[str, Any] = {
+            "path": out_path,
+            "pageCount": info["pageCount"],
+            "sha256": sha256_file(out_path),
+            "deleted": info["deleted"],
+        }
+        if audit:
+            try:
+                norm = [{"src": s, "rotate": r} for s, r in steps]
+                rec = build_arrange_audit(doc, out_path, norm, info["deleted"], src_sha)
+                result["audit"] = write_audit(rec, out_path)
+            except Exception as ex:
+                result["auditError"] = f"{type(ex).__name__}: {ex}"
         return result
 
     # ---- Word -----------------------------------------------------------------------
@@ -300,7 +405,9 @@ class Session:
             scale = WORD_DPI / 72.0
             rgb = doc.render(pno, scale)
             geo = doc.pages[pno - 1].geometry
-            grids = find_grids(rgb, scale)
+            # letters are not rules: strokes inside the page's text blocks are left out
+            grids = find_grids(rgb, scale, [(b.bounds.x * scale, b.bounds.y * scale, b.bounds.right * scale, b.bounds.bottom * scale)
+                                            for b in blocks if b.text.strip()])
             inputs.append(PageInput(pno, geo.display_w, geo.display_h, blocks, grids, rgb, scale))
             step(f"頁 {pno}", lo + span * 0.9)
         step("寫入 Word", 0.95)

@@ -102,7 +102,17 @@ class Server:
             elif cmd == "preview":
                 result = s.preview(args.get("edits", []), args.get("pages"), float(args.get("dpi", 110)))
             elif cmd == "export":
-                result = s.export(args.get("edits", []), args["out"], bool(args.get("verify", True)))
+                result = s.export(
+                    args.get("edits", []),
+                    args["out"],
+                    bool(args.get("verify", True)),
+                    audit=bool(args.get("audit", True)),
+                    audit_text=bool(args.get("auditText", True)),
+                )
+            elif cmd == "thumbnails":
+                result = s.thumbnails(args.get("pages"), float(args.get("dpi", 36)), progress=progress)
+            elif cmd == "arrange":
+                result = s.arrange(args["plan"], args["out"], audit=bool(args.get("audit", True)))
             elif cmd == "docx":
                 result = s.export_docx(
                     args["out"],

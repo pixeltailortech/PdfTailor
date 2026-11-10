@@ -102,3 +102,57 @@ def ink_bbox(rgb: np.ndarray, region: tuple[int, int, int, int], thresh: int = 9
     if len(xs) == 0:
         return None
     return (x0 + int(xs.min()), y0 + int(ys.min()), x0 + int(xs.max()) + 1, y0 + int(ys.max()) + 1)
+
+
+def make_multipage_pdf(
+    path: str,
+    n: int,
+    *,
+    size: tuple[float, float] = (300, 400),
+    outline: bool = False,
+    links: bool = False,
+) -> str:
+    """An ``n``-page PDF whose page ``i`` carries the unique, uncompressed marker
+    ``UNIQUEMARK<i>`` (so a test can tell which page's data is in a file). ``outline`` adds a
+    bookmark per page; ``links`` adds link annotations on page 1 to pages 2 and 3."""
+    c = canvas.Canvas(path, pagesize=size, pageCompression=0)
+    c.setTitle("multipage fixture")
+    for i in range(1, n + 1):
+        c.bookmarkPage(f"p{i}")
+        if outline:
+            c.addOutlineEntry(f"Chapter {i}", f"p{i}")
+        c.setFont("Helvetica", 18)
+        c.drawString(40, 300, f"Page {i}")
+        c.drawString(40, 260, f"UNIQUEMARK{i}")
+        if links and i == 1:
+            c.linkRect("", "p2", (40, 100, 140, 130), relative=0)
+            if n >= 3:
+                c.linkRect("", "p3", (160, 100, 260, 130), relative=0)
+        c.showPage()
+    c.save()
+    return path
+
+
+def make_image_pdf(path: str, n: int, *, size: tuple[float, float] = (300, 400)) -> str:
+    """An ``n``-page PDF with one unique noise image per page (so every page owns its own
+    image XObject)."""
+    rng = np.random.default_rng(7)
+    c = canvas.Canvas(path, pagesize=size, pageCompression=0)
+    for i in range(n):
+        img = Image.fromarray(rng.integers(0, 255, (60, 45, 3), dtype=np.uint8), "RGB")
+        c.drawImage(ImageReader(img), 0, 0, size[0], size[1])
+        c.showPage()
+    c.save()
+    return path
+
+
+def page_bytes(page) -> bytes:
+    """All content-stream bytes of a pikepdf page."""
+    import pikepdf
+
+    cont = page.obj.get("/Contents")
+    if cont is None:
+        return b""
+    if isinstance(cont, pikepdf.Array):
+        return b"".join(bytes(s.read_bytes()) for s in cont)
+    return bytes(cont.read_bytes())

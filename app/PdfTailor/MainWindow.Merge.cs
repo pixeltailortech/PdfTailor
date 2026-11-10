@@ -14,7 +14,7 @@ namespace PdfTailor;
 // Left navigation rail (collapsible), the PDF merge page, and the shark-cursor toggle.
 public partial class MainWindow
 {
-    private enum Mode { Edit, Merge, Word }
+    private enum Mode { Edit, Merge, Word, Pages }
 
     private const double NavWidth = 196;
 
@@ -82,6 +82,7 @@ public partial class MainWindow
     private void OnNavEdit(object sender, RoutedEventArgs e) => SetMode(Mode.Edit);
     private void OnNavMerge(object sender, RoutedEventArgs e) => SetMode(Mode.Merge);
     private void OnNavWord(object sender, RoutedEventArgs e) => SetMode(Mode.Word);
+    private void OnNavPages(object sender, RoutedEventArgs e) => SetMode(Mode.Pages);
 
     private void SetMode(Mode mode)
     {
@@ -91,17 +92,25 @@ public partial class MainWindow
         EditView.Visibility = edit ? Visibility.Visible : Visibility.Collapsed;
         MergeView.Visibility = mode == Mode.Merge ? Visibility.Visible : Visibility.Collapsed;
         WordView.Visibility = mode == Mode.Word ? Visibility.Visible : Visibility.Collapsed;
+        PagesView.Visibility = mode == Mode.Pages ? Visibility.Visible : Visibility.Collapsed;
         EditToolbar.Visibility = edit ? Visibility.Visible : Visibility.Collapsed;
         EditRight.Visibility = edit ? Visibility.Visible : Visibility.Collapsed;
         NavEdit.Tag = edit ? "active" : null;
         NavMerge.Tag = mode == Mode.Merge ? "active" : null;
         NavWord.Tag = mode == Mode.Word ? "active" : null;
-        SubTitle.Text = mode switch { Mode.Merge => "PDF 合併", Mode.Word => "PDF 轉 Word", _ => "掃描 PDF 文字編輯" };
+        NavPages.Tag = mode == Mode.Pages ? "active" : null;
+        SubTitle.Text = mode switch { Mode.Merge => "PDF 合併", Mode.Word => "PDF 轉 Word", Mode.Pages => "整理頁面", _ => "掃描 PDF 文字編輯" };
         if (mode == Mode.Merge) SetStatus(_mergeFiles.Count == 0 ? "把要合併的 PDF 拖進來，或按「加入 PDF」。" : $"清單共 {_mergeFiles.Count} 份 PDF。");
         if (mode == Mode.Word)
         {
             UpdateWordView();
             SetStatus(_path == null ? "先開啟要轉換的 PDF。" : "選擇頁面範圍後按「轉成 Word」。");
+        }
+        if (mode == Mode.Pages)
+        {
+            UpdatePagesView();
+            SetStatus(_path == null ? "先開啟要整理的 PDF。" : "選取頁面後可旋轉、刪除，或拖曳調整順序。");
+            if (_path != null) _ = LoadPagesAsync();
         }
     }
 
@@ -166,6 +175,14 @@ public partial class MainWindow
                 _mergeFiles.Move(i, i - 1); MergeList.SelectedIndex = i - 1; break;
             case "down" when i >= 0 && i < _mergeFiles.Count - 1:
                 _mergeFiles.Move(i, i + 1); MergeList.SelectedIndex = i + 1; break;
+            case "left" or "right" or "flip":
+                if (i < 0) { SetStatus("先在清單中選取要旋轉的檔案。"); break; }
+                var item = _mergeFiles[i];
+                item.Rotation += action == "left" ? -90 : action == "right" ? 90 : 180;
+                SetStatus(item.Rotation == 0
+                    ? $"{item.Name}：已回到原方向。"
+                    : $"{item.Name}：合併時整份順時針轉 {item.Rotation}°（原檔不會更動）。");
+                break;
         }
     }
 
@@ -242,6 +259,8 @@ public partial class MainWindow
         if (dlg.ShowDialog(this) != true) return;
 
         var inputs = _mergeFiles.Select(x => x.FullPath).ToList();
+        var rotations = _mergeFiles.Select(x => x.Rotation).ToList();
+        int rotated = rotations.Count(r => r != 0);
         int pages = _mergeFiles.Sum(x => x.Pages);
         var output = dlg.FileName;
         bool done = false;
@@ -251,7 +270,7 @@ public partial class MainWindow
         {
             try
             {
-                await _mergeService.MergeAsync(inputs, output, progress, ct);
+                await _mergeService.MergeAsync(inputs, output, progress, ct, rotations);
                 done = true;
             }
             catch (OperationCanceledException) { SetStatus("已取消合併。"); }
@@ -265,7 +284,9 @@ public partial class MainWindow
         UpdateMergeSummary();
         if (!done) return;
         SetStatus($"PDF 合併完成：{Path.GetFileName(output)}");
-        new DoneDialog(output, $"已合併 {inputs.Count} 份 PDF，共 {pages} 頁。") { Owner = this }.ShowDialog();
+        var detail = $"已合併 {inputs.Count} 份 PDF，共 {pages} 頁。";
+        if (rotated > 0) detail += $"\n其中 {rotated} 份已旋轉（原始檔未更動）。";
+        new DoneDialog(output, detail) { Owner = this }.ShowDialog();
     }
 
     // ================================================================ shark cursor toggle

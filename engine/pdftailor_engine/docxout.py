@@ -59,6 +59,8 @@ def _add_run(par, r: Run, force_color: bool = False) -> None:
         run.font.bold = False
     if st.italic:
         run.font.italic = True
+    elif force_color:  # Word's Heading 4 is italic; the source text is not
+        run.font.italic = False
     col = st.color
     if force_color or max(col) > 70:
         run.font.color.rgb = RGBColor(*col) if max(col) > 70 else RGBColor(0, 0, 0)
@@ -283,6 +285,10 @@ def write_docx(pages: list[PageDoc], out_path: str, title: str | None = None) ->
         sec.page_width = Pt(round(pg.width, 1))
         sec.page_height = Pt(round(pg.height, 1))
         l, t, r, b = pg.margins
+        # Word sets the same text a little taller than the PDF did (line heights of the
+        # substitute fonts, cell padding); without slack at the bottom, a page that was full
+        # spills its last line or table row onto a page of its own.
+        b = min(b, max(14.0, 0.35 * b))
         sec.left_margin, sec.top_margin = Pt(round(l, 1)), Pt(round(t, 1))
         sec.right_margin, sec.bottom_margin = Pt(round(r, 1)), Pt(round(b, 1))
         sec.header_distance = Pt(min(36.0, t / 2))

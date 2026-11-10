@@ -11,7 +11,7 @@ Coordinates returned are display points (pixel / scale), top-left origin.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
@@ -34,6 +34,8 @@ class Grid:
     hsep: list[list[bool]]  # hsep[r][c]: rule between row r and r+1 in column c
     line_pt: float  # typical rule thickness
     line_color: tuple[int, int, int] = (0, 0, 0)
+    # the strokes the grid was built from, (x0, y0, x1, y1) in points (see erase_rules)
+    strokes: list[tuple[float, float, float, float]] = field(default_factory=list)
 
     @property
     def rows(self) -> int:
@@ -56,20 +58,80 @@ def _segments(mask: np.ndarray, horizontal: bool, max_thick: float, min_len: flo
     n, _labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     out: list[_Seg] = []
     for i in range(1, n):
-        x, y, w, h, _area = (int(v) for v in stats[i])
+        x, y, w, h, area = (int(v) for v in stats[i])
         if max(w, h) < min_len:
             continue
+        # Thickness is ink per unit of length, not the box's height: a rule on a page scanned
+        # a fraction of a degree askew has a tall box (2000 px long, 0.4° → 14 px) while the
+        # stroke itself is still thin.
         if horizontal:
-            thick = h
-            if thick > max_thick:
+            thick = min(h, area / max(w, 1))
+            if thick > max_thick or h > max_thick + 0.02 * w:
                 continue
             out.append(_Seg(y + h / 2.0, x, x + w, thick))
         else:
-            thick = w
-            if thick > max_thick:
+            thick = min(w, area / max(h, 1))
+            if thick > max_thick or w > max_thick + 0.02 * h:
                 continue
             out.append(_Seg(x + w / 2.0, y, y + h, thick))
     return out
+
+
+def _isolated(mask: np.ndarray, seg: _Seg, horizontal: bool, scale: float) -> bool:
+    """A rule has blank paper along both sides; a letter's stroke has the rest of the letter.
+
+    On a scan, the long vertical strokes of bold 12–14 pt characters pass the length test
+    and turned one table into 35 columns. The ink just beside the stroke tells them apart:
+    a short stroke must be almost alone, a long one may have text close to it here and there.
+    """
+    H, W = mask.shape
+    half = int(np.ceil(seg.thick / 2.0)) + 1
+    width = max(3, int(round(1.2 * scale)))
+    p, a, b = int(round(seg.pos)), max(0, int(seg.a)), int(seg.b)
+    if b - a < 2:
+        return False
+    sides = []
+    for sgn in (-1, 1):
+        lo, hi = sorted((p + sgn * (half + 1), p + sgn * (half + width)))
+        lo, hi = max(0, lo), min((H if horizontal else W) - 1, hi)
+        if hi < lo:
+            sides.append(0.0)
+            continue
+        band = mask[lo:hi + 1, a:b] if horizontal else mask[a:b, lo:hi + 1]
+        sides.append(float(band.mean()) if band.size else 0.0)
+    length_pt = (b - a) / scale
+    limit = 0.05 + 0.15 * min(1.0, max(0.0, (length_pt - 10.0) / 40.0))
+    return (sides[0] + sides[1]) / 2.0 <= limit
+
+
+def _inside_text(seg: _Seg, horizontal: bool, boxes: list[tuple[float, float, float, float]]) -> bool:
+    """True when most of the stroke runs through boxes known to hold text."""
+    spans = []
+    for x0, y0, x1, y1 in boxes:
+        if horizontal:
+            if y0 <= seg.pos <= y1:
+                spans.append((max(seg.a, x0), min(seg.b, x1)))
+        elif x0 <= seg.pos <= x1:
+            spans.append((max(seg.a, y0), min(seg.b, y1)))
+    covered, end = 0.0, seg.a
+    for lo, hi in sorted(s for s in spans if s[1] > s[0]):
+        lo = max(lo, end)
+        if hi > lo:
+            covered += hi - lo
+            end = hi
+    return covered >= 0.6 * max(1.0, seg.b - seg.a)
+
+
+def _box_text_share(r: tuple[int, int, int, int], boxes: list[tuple[float, float, float, float]]) -> float:
+    x0, y0, x1, y1 = r
+    area = max(1.0, (x1 - x0) * (y1 - y0))
+    m = np.zeros((max(1, y1 - y0), max(1, x1 - x0)), bool)
+    for bx0, by0, bx1, by1 in boxes:
+        a0, a1 = int(max(bx0, x0) - x0), int(min(bx1, x1) - x0)
+        b0, b1 = int(max(by0, y0) - y0), int(min(by1, y1) - y0)
+        if a1 > a0 and b1 > b0:
+            m[b0:b1, a0:a1] = True
+    return float(m.sum()) / area
 
 
 def _cluster(segs: list[_Seg], tol: float) -> list[float]:
@@ -94,8 +156,13 @@ def _near(v: float, positions: list[float], tol: float) -> bool:
     return any(abs(v - p) <= tol for p in positions)
 
 
-def find_grids(rgb: np.ndarray, scale: float) -> list[Grid]:
-    """Detects ruled tables on a page rendered at ``scale`` pixels per point."""
+def find_grids(rgb: np.ndarray, scale: float, text_boxes: list[tuple[float, float, float, float]] | None = None) -> list[Grid]:
+    """Detects ruled tables on a page rendered at ``scale`` pixels per point.
+
+    ``text_boxes`` (pixels, x0 y0 x1 y1) are where text is known to be — characters the OCR
+    engine read, or text blocks. A stroke lying inside text is part of a letter (a heavy
+    title's 書 has strokes as long and as straight as a rule), not a table border.
+    """
     H, W = rgb.shape[:2]
     mask, _bg, _thr = ink_mask(rgb)
     u8 = (mask.astype(np.uint8)) * 255
@@ -109,7 +176,7 @@ def find_grids(rgb: np.ndarray, scale: float) -> list[Grid]:
     vm = cv2.morphologyEx(cv2.dilate(u8, np.ones((1, 3), np.uint8)), cv2.MORPH_OPEN,
                           cv2.getStructuringElement(cv2.MORPH_RECT, (1, lv)))
 
-    fh, fv, eh, ev, rects = _fill_edges(rgb, _bg, scale)
+    fh, fv, eh, ev, rects = _fill_edges(rgb, _bg, scale, mask, text_boxes)
     for x, y, w, h in rects:
         # A fill dark enough to count as ink is itself the stroke detector's prey, and its lettering
         # leaves slivers between the glyphs; a light fill is not ink, so its rules are real rules.
@@ -117,8 +184,11 @@ def find_grids(rgb: np.ndarray, scale: float) -> list[Grid]:
             continue
         hm[max(0, y - 2) + 3:y + h - 1, max(0, x - 2):x + w + 2] = 0
         vm[max(0, y - 3):y + h + 3, x + 3:x + w - 3] = 0
-    hsegs = _segments(hm, True, max_thick, lh)
-    vsegs = _segments(vm, False, max_thick, lv)
+    hsegs = [s for s in _segments(hm, True, max_thick, lh) if _isolated(mask, s, True, scale)]
+    vsegs = [s for s in _segments(vm, False, max_thick, lv) if _isolated(mask, s, False, scale)]
+    if text_boxes:
+        hsegs = [s for s in hsegs if not _inside_text(s, True, text_boxes)]
+        vsegs = [s for s in vsegs if not _inside_text(s, False, text_boxes)]
     hsegs += fh
     vsegs += fv
     hm = hm | eh
@@ -182,6 +252,8 @@ def find_grids(rgb: np.ndarray, scale: float) -> list[Grid]:
             hsep=hsep,
             line_pt=max(0.5, thick - 2.0 / scale),
             line_color=color,
+            strokes=[(s.a / scale, s.pos / scale - s.thick / scale, s.b / scale, s.pos / scale + s.thick / scale) for s in hs]
+                    + [(s.pos / scale - s.thick / scale, s.a / scale, s.pos / scale + s.thick / scale, s.b / scale) for s in vs],
         ))
     grids.sort(key=lambda g: (g.bounds.y, g.bounds.x))
     return grids
@@ -236,7 +308,8 @@ def _rule_color(rgb, hm, vm, xs, ys) -> tuple[int, int, int]:
     return (int(c[0]), int(c[1]), int(c[2]))
 
 
-def _fill_edges(rgb: np.ndarray, bg, scale: float):
+def _fill_edges(rgb: np.ndarray, bg, scale: float, ink: np.ndarray | None = None,
+                text_boxes: list[tuple[float, float, float, float]] | None = None):
     """Shaded cells (a coloured header band, grey cells) have no rules of their own, yet their
     edges are the table's grid. Returns each solid rectangle's four edges as segments plus the
     same edges drawn as masks (for the separator test).
@@ -258,6 +331,11 @@ def _fill_edges(rgb: np.ndarray, bg, scale: float):
         x, y, w, h, area = (int(v) for v in stats[i])
         if w < min_w or h < min_h or w * h > 0.6 * W * H or area < 0.7 * w * h:
             continue
+        # A heavy glyph or a logo is a small, solid, ink-dark blob: not a shaded cell.
+        if ink is not None and w < 40 * scale and float(ink[y:y + h, x:x + w].mean()) > 0.5:
+            continue
+        if text_boxes and _box_text_share((x, y, x + w, y + h), text_boxes) > 0.5:
+            continue
         rects.append((x, y, w, h))
         for yy in (y, y + h - 1):
             hs.append(_Seg(float(yy), float(x), float(x + w), 3.0))
@@ -266,3 +344,30 @@ def _fill_edges(rgb: np.ndarray, bg, scale: float):
             vs.append(_Seg(float(xx), float(y), float(y + h), 3.0))
             ev[y:y + h, max(0, xx - 1):xx + 2] = 255
     return hs, vs, eh, ev, rects
+
+
+def erase_rules(rgb: np.ndarray, grids: list[Grid], scale: float) -> np.ndarray:
+    """A copy of the page with the tables' rules painted over in the paper colour.
+
+    Text is measured and read from this copy: a rule inside a line's crop counted as a
+    giant "glyph" (a cell's 報到 came out 36 pt) and was read as | or [ .
+    """
+    if not grids:
+        return rgb
+    mask, bg, _thr = ink_mask(rgb)
+    u8 = mask.astype(np.uint8) * 255
+    lh = max(12, int(round(MIN_H_LINE_PT * scale)))
+    lv = max(8, int(round(MIN_V_LINE_PT * scale)))
+    hm = cv2.morphologyEx(u8, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (lh, 1)))
+    vm = cv2.morphologyEx(u8, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, lv)))
+    lines = cv2.dilate(hm | vm, np.ones((3, 3), np.uint8)) > 0
+    H, W = mask.shape
+    sel = np.zeros((H, W), bool)
+    for g in grids:
+        for x0, y0, x1, y1 in g.strokes:
+            a0, a1 = max(0, int(x0 * scale) - 3), min(W, int(np.ceil(x1 * scale)) + 4)
+            b0, b1 = max(0, int(y0 * scale) - 3), min(H, int(np.ceil(y1 * scale)) + 4)
+            sel[b0:b1, a0:a1] = True
+    out = rgb.copy()
+    out[lines & sel & mask] = bg
+    return out

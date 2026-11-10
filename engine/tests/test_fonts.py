@@ -33,7 +33,8 @@ def test_cache_round_trip(tmp_path):
 def test_office_script_split(fonts):
     r = fonts.resolve(TextStyle(), "本公司資料 ■□「引用」 Total 42")
     fams = [(s.text.strip(), s.face.family) for s in r.segments]
-    assert fams[0][1] == "Noto Sans CJK TC" and "■" in fams[0][0] and "「" in fams[0][0]
+    # the CJK face depends on the machine (Noto Sans CJK TC on Linux, Microsoft JhengHei on Windows)
+    assert fonts.is_cjk_family(fams[0][1]) and "■" in fams[0][0] and "「" in fams[0][0]
     assert fams[-1][0] == "Total 42" and not fonts.is_cjk_family(fams[-1][1])
 
 

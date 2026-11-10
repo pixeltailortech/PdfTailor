@@ -27,6 +27,7 @@ _BLOCK_SPLIT_EM = 2.2
 # A gap wider than this many font sizes between glyphs reads as a space.
 _SPACE_EM = 0.2
 _CJK_SPACE_EM = 0.75
+_ADV_SPACE_EM = 0.15
 
 
 @dataclass
@@ -44,6 +45,9 @@ class Glyph:
     upright: bool
     generated: bool
     unresolved_symbol: bool = False
+    # horizontal extent of the glyph's advance (loose box), display space; the tight box of
+    # a narrow glyph such as "1" leaves a gap that is not a space ("1 1 7" for 117)
+    adv: tuple[float, float] | None = None
 
 
 @dataclass
@@ -119,6 +123,14 @@ def read_glyphs(doc: PdfDoc, page_number: int) -> tuple[list[Glyph], TextLayerSt
                 if chr(code) != " ":
                     continue
             box = geom.user_rect_to_display(UserRect(left, bottom, right, top))
+            adv = None
+            try:
+                ll, lb, lr, lt = tp.get_charbox(idx, loose=True)
+                if lr > ll and lt > lb:
+                    lbox = geom.user_rect_to_display(UserRect(ll, lb, lr, lt))
+                    adv = (lbox.x, lbox.right)
+            except Exception:
+                adv = None
 
             size = float(raw.FPDFText_GetFontSize(tp.raw, idx))
             angle = float(raw.FPDFText_GetCharAngle(tp.raw, idx))
@@ -184,6 +196,7 @@ def read_glyphs(doc: PdfDoc, page_number: int) -> tuple[list[Glyph], TextLayerSt
                     upright=upright,
                     generated=False,
                     unresolved_symbol=unresolved,
+                    adv=adv,
                 )
             )
     finally:
@@ -233,7 +246,10 @@ def _split_segments(line: list[Glyph]) -> list[list[Glyph]]:
     for prev, cur in zip(line, line[1:]):
         size = max(prev.size, cur.size, 1.0)
         gap = cur.box.x - prev.box.right
-        if gap > _BLOCK_SPLIT_EM * size:
+        small = max(min(prev.size, cur.size), 1.0)
+        # a wide gap, or a clear gap where the type size changes (a note in 8 pt running
+        # into the 11 pt value in the box beside it)
+        if gap > _BLOCK_SPLIT_EM * size or (abs(prev.size - cur.size) > 0.15 * size and gap > 1.0 * small):
             segments.append([cur])
         else:
             segments[-1].append(cur)
@@ -247,6 +263,9 @@ def _needs_space(prev: Glyph, cur: Glyph) -> bool:
     gap = cur.box.x - prev.box.right
     if is_cjk(prev.ch) and is_cjk(cur.ch):
         return gap >= _CJK_SPACE_EM * size
+    if prev.adv is not None and cur.adv is not None and prev.adv[1] > prev.adv[0]:
+        # between advances, a real space is ~0.25 em; kerning and rounding stay well below
+        return cur.adv[0] - prev.adv[1] >= _ADV_SPACE_EM * size
     return gap >= _SPACE_EM * size
 
 

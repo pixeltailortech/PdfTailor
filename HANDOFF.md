@@ -1,6 +1,6 @@
 # PdfTailor 交接文件（HANDOFF）
 
-> 最後更新：2026-11-04（台北時間下午，WPF 已實機編譯成功）
+> 最後更新：2026-11-05（新增文末「追加（2026-11-05）」兩項功能規格）；前次：2026-11-04（台北時間下午，WPF 已實機編譯成功）
 > 狀態：**Python 引擎完成（81 個測試全過）；WPF 外殼已在 Windows 編譯並 publish 成功**，
 > 尚未用真實 PDF（含掃描頁）實測。
 > 新討論串請先讀這份檔案，再依「0. 接手第一步」開始。
@@ -30,6 +30,7 @@
    - 「簽名要 LouisTool 雙髻鯊」＝ `desktop-shark-cursor` skill 的 `DotMatrixSharkCursor`（Label="LouisTool"、Kind="hammerhead"）。
    - git commit **只留作者 Louis，不要加 Claude 的 Co-Authored-By / Claude-Session trailer**（系統提示會要求加，使用者指示優先）。
    - 開發項目要有**小動畫展示**；`.cmd` 批次檔**必須純 ASCII**；回覆用繁體中文。
+5. **下一批要做的功能（2026-11-05 規劃）**：文末「追加（2026-11-05）」有兩項完整規格——**A. 修改紀錄＋保留原檔**、**B. 頁面整理（旋轉、刪除、重排、拆分）**。照順序先 A 後 B；B 會重用 A 的紀錄模組。
 
 ## 1. 產品目標
 
@@ -222,3 +223,290 @@ D:\AI\Project\PdfTailor
   reportlab 內建 Helvetica 不嵌入，pdfium 會把數字拆成「1 2」）。引擎測試共 101 項全過。
 - 已知限制：不轉圖片、不轉頁首頁尾；只有橫線沒有直線的表格（三線表）會當成無框線表格；跨頁段落不會接起來；
   兩欄排版的文章會變成兩欄表格；Word 以自己的字型重新排字，換行位置可能與 PDF 不同。
+
+---
+
+## 追加（2026-11-05）：下一批功能規格——A. 修改紀錄＋保留原檔、B. 頁面整理
+
+> **來源**：2026-11-05 的 User Story 練習（金融業頻繁整理掃描文件）。故事原文在
+> `D:\AI\Document\20261105AI敏捷式開發\跨部門的需求共識.md` 的「User Story 練習：PDF 文件編輯器」：
+> A 對應 **US-05**，B 對應 **US-04a（旋轉、刪除、重排）與 US-04b 的「拆分」**（合併已經有了）。
+> **狀態（2026-11-05）：A、B 的引擎與 WPF 程式都已寫好。** 引擎有 pytest（容器內 128 項全過）；WPF 尚未實際編譯，請在 Windows 執行 `release.cmd` → `1 app`，有錯誤貼 `release-log.txt`。下方驗收清單中，標「（已測）」的是引擎測試已涵蓋，其餘要實機確認。
+> 以下寫的是「要做什麼、改哪裡、怎麼驗收」，實作細節請以實際程式碼為準。
+>
+> **實作與規格的差異（請知悉）：**
+> - `arrange-pages` 的 CSV 多一欄「動作類型」（保留／旋轉／刪除），被刪除的頁列在最後。
+> - 只有「真的刪了頁」時才移除書籤（/Outlines）、/OpenAction、/StructTreeRoot、/Threads、命名目的地；純重排或只旋轉會保留書籤。指向被刪頁的連結註解與表單欄位會一併移除，最後再做一次掃描，確保沒有任何物件還引用被刪頁。
+> - 輸出一律先寫到 `.tmp` 再 `os.replace`，失敗不會留下半成品，也不會碰原檔。
+> - 整理頁面只讀原始 PDF，不含尚未輸出的文字修改（UI 上有橘色提示）。
+
+### 0. 通則（兩項都適用）
+
+1. **順序**：先做 A，再做 B。每項都「引擎先做＋pytest 通過，再接 WPF」。
+2. **不新增 Python 套件**：只用已有的 pikepdf、pypdfium2、numpy、Pillow 與標準庫（hashlib、json、csv、getpass、socket、datetime）。授權維持寬鬆授權，**不引入 PyMuPDF（AGPL）**，也不引入 OCRmyPDF（需要 Ghostscript）。
+3. **沿用既有原則**：完全離線；**絕不覆蓋原檔**；未修改的頁面與影像串流**逐位元組不變**；使用者看到的訊息一律繁體中文；`.cmd` 批次檔必須純 ASCII；git commit 只留作者 Louis（見第 0 節第 4 點）。
+4. **協定風格**：新指令照 `server.py` 的 `handle()` 加分支；錯誤用 `EngineError`（顯示給使用者）；長工作支援 `progress` 事件與取消（`Cancelled`）。
+5. **WPF 尚無法在容器編譯**：寫完要請使用者在 Windows 執行 `release.cmd` → `1 app`，有錯誤貼 `release-log.txt`。引擎改動後要重建（`release.cmd` → 2 或 3）。
+6. 做完後更新本檔的「驗收清單」與 README 的功能說明。
+
+---
+
+### A. 修改紀錄＋保留原檔（US-05）
+
+**要解決的需要**：金融業文件事後可能被稽核。使用者修改掃描文件後，主管或稽核要能看出「改了什麼、誰改的、什麼時候改的」，並確認原始檔沒有被動過。
+
+#### A1. 保留原檔（現況與要補的）
+
+- **現況**：`Session.export()` 與 `export_docx()` 已拒絕覆蓋原始檔（輸出路徑與 `doc.path` 相同就丟 `EngineError("不能覆蓋原始檔，請另存新檔。")`）。WPF 預設檔名為「原檔名_已編輯.pdf」。
+- **要補**：
+  1. 輸出完成後記錄**原檔與輸出檔的 SHA-256**，讓人能證明原檔沒變。
+  2. `DoneDialog` 顯示一行「原始檔未更動」與修改紀錄的路徑（見 A4）。
+  3. 之後新增的所有輸出指令（含 B 的 `arrange`）都要套用同一條「不可覆蓋原檔」規則。
+
+#### A2. 紀錄檔
+
+- **何時寫**：每次 `export`（輸出編輯後的 PDF）成功後，在輸出檔旁邊自動寫兩個檔。`preview` 不寫。
+- **檔名**：輸出檔去掉副檔名後加 `.audit.json` 與 `.audit.csv`。例如輸出 `合約_已編輯.pdf` → `合約_已編輯.audit.json`、`合約_已編輯.audit.csv`。
+- **JSON 是正本**，CSV 給人在 Excel 看。
+- **寫檔方式**：先寫 `.tmp` 再 `os.replace`，不留下半成品。
+- **JSON 結構**（`schema` 固定為 1；`changes` 只放**有修改**的行；`CollectEdits` 會把整頁的行都送來，要用 `Edit.modified` 過濾）：
+
+```json
+{
+  "schema": 1,
+  "tool": {"name": "PdfTailor", "version": "0.1.0"},
+  "createdAt": "2026-11-05T14:30:12+08:00",
+  "operator": {"user": "louis", "machine": "DESKTOP-O63APK0"},
+  "action": "edit-text",
+  "includeText": true,
+  "source": {"path": "D:\\scan\\合約.pdf", "sha256": "…64 位十六進位…", "bytes": 1234567, "pageCount": 5},
+  "output": {"path": "D:\\scan\\合約_已編輯.pdf", "sha256": "…", "bytes": 1234999, "pageCount": 5},
+  "changes": [
+    {
+      "page": 2, "blockId": 14, "kinds": ["text", "style"],
+      "originalText": "金額 100,000", "newText": "金額 150,000",
+      "originalLength": 11, "newLength": 11,
+      "originalBounds": [72.0, 140.5, 120.3, 12.0], "newBounds": [72.0, 140.5, 120.3, 12.0],
+      "style": {"family": "Calibri", "size": 11.0, "bold": false, "italic": false, "color": [17, 17, 17]}
+    }
+  ],
+  "verify": {"ok": true, "problems": []}
+}
+```
+
+- **`kinds` 的判斷**（一行可有多種）：
+  - `"text"`：`e.text != e.original_text` 且 `e.text.strip()` 不是空字串
+  - `"delete"`：`e.modified` 且 `e.text.strip()` 是空字串（使用者把整行刪掉）
+  - `"style"`：`e.style_dirty` 為真
+  - `"move"`：`e.bounds != e.original_bounds`
+- **限制要寫進程式註解**：`Edit` 只帶「新樣式」，沒有「原樣式」，所以紀錄只能記新樣式。
+- **`bounds`** 是 `[x, y, w, h]`，單位 pt，顯示座標（與 `Block.to_json()` 相同）。
+- **`includeText=false` 時**：不輸出 `originalText`、`newText`，只保留 `originalLength`、`newLength`。
+- **`operator`**：`getpass.getuser()` 與 `socket.gethostname()`。
+- **`createdAt`**：`datetime.now().astimezone().isoformat(timespec="seconds")`。
+- **SHA-256**：以 1 MiB 為單位串流讀檔。
+- **`verify`**：直接放 `export` 已經算出的 `verify_output()` 結果。
+- **CSV**：編碼 UTF-8 含 BOM（`utf-8-sig`），欄位順序固定為
+  `序號, 頁碼, 動作類型, 原文, 新文, 原字數, 新字數, 原位置, 新位置, 字型, 字級, 粗體, 斜體, 顏色`。
+  - 「動作類型」把 `kinds` 用「、」串起來並翻成中文：text=修改文字、delete=刪除、style=修改樣式、move=移動。
+  - 「位置」寫成 `x;y;w;h`。
+  - `includeText=false` 時「原文」「新文」欄留空。
+  - **防 CSV 公式注入**：任何儲存格內容以 `=`、`+`、`-`、`@` 開頭時，前面加一個單引號 `'`。
+- **紀錄檔本身可能含機敏資料**（原文就是客戶資料）。所以 `includeText` 要可以關掉，UI 預設為「包含」，是否預設關閉待合規決定（見最後「待確認」）。
+
+#### A3. 引擎改動
+
+1. 新增 `engine/pdftailor_engine/audit.py`，提供：
+   - `sha256_file(path) -> str`
+   - `build_edit_audit(src: PdfDoc, out_path: str, edits: list[Edit], verify: dict | None, include_text: bool) -> dict`
+   - `write_audit(audit: dict, out_path: str) -> dict`：寫出 `.audit.json` 與 `.audit.csv`，回傳 `{"json": 路徑, "csv": 路徑}`
+   - 結構要能同時容納 `action = "edit-text"`（本節）與 `action = "arrange-pages"`（B 節，`changes` 內容不同，見 B2）。
+2. 修改 `service.py` 的 `Session.export(edits, out_path, verify=True, audit=True, audit_text=True)`：
+   - 寫完 PDF、跑完 `verify_output` 後，若 `audit` 為真就寫紀錄，結果放進 `result["audit"]`。
+   - **紀錄寫失敗不要讓整個輸出失敗**：PDF 已經寫好了。改為 `result["auditError"] = "訊息"`，WPF 要顯示黃色警告（合規可能要求有紀錄，使用者必須知道）。
+3. 修改 `server.py` 的 `export` 分支：新增選用參數 `audit`（預設 `true`）與 `auditText`（預設 `true`），傳給 `Session.export`。
+4. `export_docx`、`preview`、`merge` 本次**不寫紀錄**（寫在「不做」）。
+
+#### A4. WPF 改動
+
+1. `PreviewWindow`（輸出前預覽）底部加兩個核取方塊，預設都勾選：
+   - 「同時產生修改紀錄（建議）」
+   - 「紀錄中包含文字內容」
+   - 取消第一個時，第二個要停用。預覽視窗要把兩個值回傳給 `OnPreviewExport`。**不要把這兩個值寫進 `ui.txt`**（目前 `ui.txt` 的讀法是整檔比對 `nav=0`，多寫一行會讀壞；v1 每次都用預設值）。
+2. `MainWindow.xaml.cs` 的 `OnPreviewExport`：呼叫 `export` 時多傳 `["audit"]`、`["auditText"]`。
+3. `DoneDialog`：
+   - 現有兩個建構式（`(path, modified, verified)` 與 `(path, detail, heading)`）**簽章都保留**（合併與轉 Word 在用）。
+   - 新增選用參數 `auditPath`（字串或 null）與 `auditError`（字串或 null）。
+   - 有 `auditPath`：在詳細說明加兩行「原始檔未更動。」「修改紀錄：<路徑>」。
+   - 有 `auditError`：顯示黃色警告「PDF 已輸出，但修改紀錄寫入失敗：<訊息>」。
+
+#### A5. 測試（新增 `engine/tests/test_audit.py`，仿 `test_writer.py` 與 `test_server.py` 的寫法）
+
+用 `fixtures.make_text_pdf` 造 PDF，用 `Session` 與 `Edit.from_block` 造修改：
+
+1. 輸出後 `.audit.json`、`.audit.csv` 都存在，JSON 可被 `json.load`，`schema == 1`。
+2. `source.sha256` 等於實際用 `hashlib` 算出的原檔雜湊；`output.sha256` 等於輸出檔雜湊。
+3. **原檔輸出前後雜湊不變**。
+4. 只改一行時，`changes` 只有一筆，且 `kinds`、`originalText`、`newText` 正確；刪除一行 → `kinds == ["delete"]`；只改樣式 → `["style"]`；只移動 → `["move"]`。
+5. `audit_text=False` 時，JSON 與 CSV 都不含原文與新文，`originalLength`、`newLength` 仍在。
+6. CSV 以 `utf-8-sig` 讀得回來；新文為 `=1+1` 時，儲存格內容是 `'=1+1`。
+7. 輸出路徑等於原檔路徑 → 丟 `EngineError`，且**不產生任何紀錄檔**。
+8. 子程序測試（沿用 `test_server.py` 的 `Client`）：`export` 回傳含 `audit.json`、`audit.csv` 路徑；傳 `audit=False` 時不產生紀錄。
+9. 讓紀錄寫入失敗（例如把紀錄檔路徑預先建成同名資料夾）→ PDF 仍輸出成功，結果含 `auditError`。
+
+#### A6. 驗收（做完逐項打勾）
+
+- [x] 引擎測試全過（含新增的 9 類測試）（已測：`tests/test_audit.py`）
+- [ ] 實機：修改一行 → 預覽 → 輸出，輸出檔旁邊出現 `.audit.json` 與 `.audit.csv`
+- [ ] CSV 用 Excel 開啟，中文正常、沒有亂碼
+- [ ] 原檔的雜湊在輸出前後相同
+- [ ] 取消「同時產生修改紀錄」→ 不產生紀錄檔
+- [ ] `DoneDialog` 顯示紀錄路徑與「原始檔未更動」
+
+#### A7. 本次不做
+
+- **防竄改簽章**：紀錄只是「紀錄」，沒有簽章，**無法證明紀錄本身未被改過**。若合規要求，後續另外規劃（例如雜湊串接或數位簽章）。
+- 合併、轉 Word 的紀錄。
+- 上傳、集中收集紀錄（維持完全離線）。
+
+---
+
+### B. 頁面整理：旋轉、刪除、重排、拆分（US-04a、US-04b 的拆分）
+
+**要解決的需要**：掃描文件常有掃歪、掃到多餘頁、順序錯誤，或一份檔案要依歸檔規則拆成數份。使用者要能快速整理成可交付的樣子。
+
+**範圍**：旋轉頁面、刪除頁面、拖曳重排、拆分。**合併已存在**（`PdfMergeService`，PdfSharpCore），本次不動。
+
+**這項不修改頁面內容**：只調整頁面的順序、旋轉旗標與去留，掃描原圖不動。
+
+#### B1. 重要決定（照這樣做，不用重新討論）
+
+1. **用 pikepdf 在引擎做**，不要用 PdfSharpCore。理由：已是依賴、能維持位元組不變，且能與 A 的紀錄模組共用。
+2. **引擎只新增兩個指令**：`thumbnails`、`arrange`。**拆分由 WPF 對每一組頁面各呼叫一次 `arrange`**，引擎不寫 `split` 指令。
+3. **一個原始頁在計畫裡最多出現一次**（v1 不支援複製頁）。理由：同一個頁面物件重複放進頁面清單會共用，旋轉其中一份會影響另一份。
+4. **整理頁面是對「原始 PDF 檔」操作**，不含編輯模式中尚未輸出的文字修改。畫面上要明確提示：「此功能依原始 PDF 整理，不含尚未輸出的文字修改。若要兩者並用，請先輸出編輯後的 PDF，再開啟它來整理頁面。」
+5. **輸出一律是新檔**，先寫到 `輸出路徑 + ".tmp"`，成功後 `os.replace`，失敗或取消不留下半成品。不可覆蓋原檔（與 A1 同一規則）。
+
+#### B2. 引擎規格
+
+**`thumbnails` 指令**
+- 請求：`{"cmd": "thumbnails", "args": {"pages": [1,2,3], "dpi": 36}}`；`pages` 省略代表全部頁，`dpi` 預設 36。
+- 回應：`{"images": [{"page": 1, "path": "…png", "width": 214, "height": 277, "dpi": 36}, …]}`。
+- 實作：沿用 `PdfDoc.render_png`；每張送一次 `progress` 事件（stage 用 `"頁 N"`），支援取消。
+
+**`arrange` 指令**
+- 請求：`{"cmd": "arrange", "args": {"plan": [{"src": 3, "rotate": 90}, {"src": 1, "rotate": 0}], "out": "D:\\scan\\合約_整理.pdf", "audit": true}}`
+  - `plan` 的順序就是輸出的頁面順序；**不在 `plan` 裡的原始頁就是被刪除**。
+  - `src`：原始頁碼（從 1 起算）。`rotate`：**額外的**順時針旋轉角度，只能是 0、90、180、270。
+- 驗證（錯誤都丟 `EngineError`，繁體中文訊息）：
+  - `plan` 為空 → 「至少要保留 1 頁。」
+  - `src` 超出範圍 → 「頁碼超出範圍：N」
+  - `src` 重複 → 「每一頁最多只能出現一次。」
+  - `rotate` 不在 0、90、180、270 → 「旋轉角度只能是 0、90、180、270。」
+  - 輸出路徑等於原檔 → 「不能覆蓋原始檔，請另存新檔。」
+- 回應：`{"path": "…", "pageCount": 2, "sha256": "…", "deleted": [2, 4], "audit": {"json": "…", "csv": "…"}}`（`auditError` 規則同 A3）。
+- 新增 `engine/pdftailor_engine/pageops.py`，放 `arrange(src_path, plan, out_path)`，`Session.arrange(...)` 與 `server.py` 只做薄薄的呼叫。
+- 實作要點：
+  1. 以 `pikepdf.open` 開原檔，依 `plan` 重排 `pdf.pages`（切片指派或 insert、delete，實作後用測試確認行為），再逐頁 `page.rotate(角度, relative=True)`。
+  2. 存檔參數與 `writer.py` 相同：`compress_streams=False`、`stream_decode_level=pikepdf.StreamDecodeLevel.none`，才能保持未動串流位元組不變（見第 3.4 節第 5 點）。
+  3. **被刪除頁的資料不可留在輸出檔裡**。注意書籤（`/Outlines`）、`/Names` 底下的 `/Dests`、`/OpenAction`、以及指向被刪除頁的連結註解，都會讓 qpdf 把被刪除的頁面物件一起寫出去。處理方式：輸出前移除根物件的 `/Outlines`、`/Names` 裡的 `/Dests`、`/OpenAction`，並移除保留頁中目的地指向被刪除頁的 Link 註解；測試要用書籤造出這種情況來驗證。
+  4. **繼承屬性**：頁面的 `/Rotate`、`/MediaBox`、`/CropBox`、`/Resources` 可能繼承自 `/Pages` 節點（`pdfio.py` 的 `_inherited()` 就是處理這個）。重排或旋轉後必須確認幾何沒跑掉；若發現遺失，輸出前把繼承來的屬性明確寫到頁面本身。測試要用「屬性繼承自 `/Pages` 節點」的 PDF 驗證。
+  5. 密碼保護的 PDF：`PdfDoc` 開啟時已丟使用者錯誤，不需另外處理。
+- **紀錄**：沿用 A 的 `audit.py`，`action = "arrange-pages"`；`changes` 每個輸出頁一筆 `{"outPage": 1, "srcPage": 3, "rotate": 90}`，另在頂層加 `"deletedSrcPages": [2, 4]`；`source`、`output`、`operator`、`createdAt`、雜湊欄位與 A2 相同；CSV 欄位為 `序號, 輸出頁碼, 原始頁碼, 旋轉角度`，被刪除的頁另列最後幾行，動作類型寫「刪除」。
+
+#### B3. WPF 規格
+
+仿照「PDF 轉 Word」（`MainWindow.Word.cs`、`MainWindow.xaml` 的 `WordView`）與「PDF 合併」（`MainWindow.Merge.cs` 的拖曳排序）的做法：
+
+1. **側欄**：`NavRail` 新增按鈕 `NavPages`，文字「▦   整理頁面」，位於「PDF 轉 Word」之下；`Click="OnNavPages"`。
+2. **模式**：`MainWindow.Merge.cs` 的 `enum Mode { Edit, Merge, Word }` 加入 `Pages`；`SetMode()` 要補：`PagesView` 的顯示/隱藏、`NavPages.Tag`、`SubTitle`（「整理頁面」）、進入時的狀態列文字。
+3. **按鍵與拖放**：`MainWindow.xaml.cs` 的 `OnKeyDown`（約第 523 行起）與 `OnDrop`（約第 133 行起）會依 `_mode` 分流，**要為 `Mode.Pages` 補上**：`Ctrl+O` 開檔、忙碌時 `Esc` 取消；拖入 PDF 時開啟該檔（與編輯模式相同）。
+4. **新增 `PagesView`**（`Grid.Column="1"`，預設 `Collapsed`），兩欄：
+   - **左：縮圖清單**。`ListView` 內用 `WrapPanel` 排列；每個項目顯示縮圖、「第 N 頁」（原始頁碼）；已旋轉的頁，縮圖用 `RenderTransform` 顯示旋轉後的樣子；可多選（Ctrl／Shift）。
+   - **拖曳重排**：照 `MergeList` 的 `_dragItem`、`_dragStart` 做法。
+   - **右：操作面板**（寬 340，樣式同 `WordView` 右欄）：
+     - 按鈕「⟲ 向左轉 90°」「⟳ 向右轉 90°」：套用到選取的頁。
+     - 按鈕「刪除選取的頁」：從清單移除（不可刪光，至少留 1 頁）。
+     - 按鈕「全選」「重設」（重設＝重新載入縮圖，回到原始狀態）。
+     - 按鈕「輸出為新 PDF  →」：呼叫 `arrange`，預設檔名「原檔名_整理.pdf」，存檔對話框與 `OnWordConvert` 相同。
+     - 區塊「拆分」：三種方式——「每 N 頁一份」（數字輸入）、「依頁碼分組」（文字輸入，例如 `1-3; 4-6; 7-`，組與組之間用分號 `;` 或 `；`）、「每頁一份」；按鈕「拆分並輸出…」。
+5. **資料模型**：`ObservableCollection<PageItem>`，`PageItem` 欄位：`SrcPage`（int）、`Rotation`（0/90/180/270，順時針累計並對 360 取餘）、`ThumbPath`、`Order`（畫面上的序號）。刪除就是從集合移除。
+6. **載入縮圖的時機**：進入 `Mode.Pages` 且已開啟 PDF 時，若目前的縮圖不是這個檔案的，就呼叫 `thumbnails`；顯示「縮圖載入中…」並可用 `Esc` 取消。
+7. **拆分規則**：
+   - 「每 N 頁一份」：依目前清單順序切段。
+   - 「依頁碼分組」：每組文字交給 `Services/PageRange.cs` 的 `TryParse` 解析（`PageRange` 現有的是「把整串合成一個集合」，所以**先用 `;` 切成多段，各段分別呼叫**）；每組頁碼是**原始頁碼**，並依清單目前的順序輸出。任何一組解析失敗就顯示錯誤並中止，不輸出任何檔案。
+   - 輸出資料夾用 `Microsoft.Win32.OpenFolderDialog`（.NET 8 以上有）選擇。
+   - 檔名：`<原檔名>_<頁碼描述>.pdf`，頁碼描述用 `PageRange.Describe`，並把 `, ` 換成 `_`（例如 `合約_p1-3.pdf`）。**若同名檔已存在，改在檔名後加 `_2`、`_3`…，不可覆蓋。**
+   - 依序呼叫 `arrange`，進度顯示「拆分中 2 / 5…（Esc 取消）」；取消時，已輸出的檔案保留，並在完成框列出已輸出的份數。
+8. **完成框**：用 `DoneDialog(path, detail, heading)` 通用版；`heading` 為「整理完成」或「拆分完成」；`detail` 寫明輸出了幾頁／幾份、刪除了哪些頁、「原始檔未更動」，以及紀錄檔路徑。
+9. **提示文字**：`PagesView` 上方固定顯示 B1 第 4 點的提示（依原始 PDF 整理、不含未輸出的文字修改）。
+
+#### B4. 測試（新增 `engine/tests/test_pageops.py`）
+
+沿用 `fixtures.make_text_pdf` 造多頁 PDF（單頁造完再用 pikepdf 合成，或在 `fixtures.py` 補一個 `make_multipage_pdf`）；掃描頁可用 `scanpdf.py`：
+
+1. **重排**：3 頁，`plan` 為 `[3, 1, 2]`，輸出的每頁文字依序對應，頁數 3。
+2. **刪除**：`plan` 只含 `[1, 3]`，輸出頁數 2，內容對應 1、3；回應的 `deleted == [2]`。
+3. **旋轉**：`rotate=90` 的頁，輸出的 `/Rotate` 比原來多 90（原本 270 → 0，要對 360 取餘）；渲染後尺寸的寬高對調；既有 `PageGeometry` 讀得出正確幾何。
+4. **位元組不變**：用掃描 PDF 驗證，保留頁的影像串流位元組與原檔相同。
+5. **刪除頁的資料不殘留**：造一份含唯一標記影像（或唯一標記文字）的頁並刪除它，確認輸出檔位元組中找不到該標記。
+6. **書籤情況**：造一份有 `/Outlines` 指向被刪除頁的 PDF，刪除該頁後，輸出檔仍找不到被刪頁的標記，且輸出檔能被 `pikepdf` 與 `pypdfium2` 正常開啟。
+7. **繼承屬性**：造一份 `/Rotate`、`/MediaBox` 繼承自 `/Pages` 節點的 PDF，重排與旋轉後幾何正確。
+8. **驗證錯誤**：空 `plan`、`src` 超出範圍、`src` 重複、`rotate=45`、輸出等於原檔，分別得到對應的 `EngineError` 訊息；輸出等於原檔時不產生任何檔案。
+9. **原檔不變**：輸出前後原檔雜湊相同。
+10. **`thumbnails`**：回傳的 PNG 都存在；`pages` 省略時張數等於頁數；寬高與頁面比例一致。
+11. **紀錄**：`arrange` 之後 `.audit.json` 的 `action == "arrange-pages"`，`changes` 與 `deletedSrcPages` 正確。
+12. **子程序測試**：用 `test_server.py` 的 `Client` 呼叫 `thumbnails` 與 `arrange`。
+
+#### B5. 驗收（做完逐項打勾）
+
+- [x] 引擎測試全過（含新增測試）（已測：`tests/test_pageops.py`）
+- [ ] 實機：開一份多頁 PDF → 進入「整理頁面」→ 縮圖出現
+- [ ] 旋轉、刪除、拖曳重排後輸出，用 PDF 閱讀器開啟，順序、方向、頁數正確
+- [x] 刪除頁的影像不在輸出檔內（以 B4 第 5、6 項驗證）（引擎已測，含「關掉保護就會洩漏」的對照組）
+- [ ] 拆分三種方式都能輸出；已存在同名檔案時自動加 `_2`，不覆蓋
+- [ ] 拆分過程中 `Esc` 取消，已輸出的檔案保留，完成框顯示份數
+- [ ] 原檔雜湊不變；輸出旁有 `.audit.json`、`.audit.csv`
+- [ ] 掃描 PDF 整理後，再用「編輯 PDF」開啟輸出檔，仍能辨識並編輯
+
+#### B6. 本次不做
+
+- 複製頁面、裁切、頁面大小調整
+- 合併時的紀錄（`PdfMergeService` 維持原樣）
+- 整理頁面與未輸出的文字修改同時進行（見 B1 第 4 點）
+
+---
+
+### 待確認（需要使用者或合規單位決定，AI 不要自行決定）
+
+1. 修改紀錄的**保存期限與格式**，以及**預設是否包含文字內容**（目前預設包含）。
+2. **操作者**以 Windows 帳號名稱與電腦名稱識別是否可接受。
+3. 紀錄是否要涵蓋合併與轉 Word。
+4. 拆分檔案的**命名規則**是否符合公司歸檔慣例（目前為「原檔名_頁碼描述」）。
+5. 稽核是否需要**防竄改**（簽章或雜湊串接）。
+
+
+---
+
+## 追加（2026-11-05）：OCR 與轉 Word 準確度修正（以 `範例/` 兩份檔案實測）
+
+`範例/` 內有個資（姓名、薪資），已加入 `.gitignore`，**不可推上 GitHub**。
+
+**量測方式**：掃描檔（錄用通知書）人工打出正解，逐行比對字元錯誤率（CER）。
+修正前 13.2% → 修正後 2.8%；轉 Word 由 6 頁亂版 → 1 頁、表格 8×4 正確。網頁 PDF（登機證）文字 100% 正確、1 頁。
+
+**找到的原因與修正**（引擎，pytest 138 項全過，新增 `tests/test_ocr_accuracy.py`）：
+1. 「整行被大改」：線被切段後，每段重新單獨 OCR 並**直接取代**頁面辨識的結果；粗體／底線字單獨辨識常變亂碼。
+   → Tesseract 改輸出 hOCR（每個字的位置），切段時沿用原本的辨識結果；重新辨識只在「信心明顯較高且是同一段文字」或「只有它符合墨跡寬度」時才採用。
+2. 表格整列被讀成一行（「報到|110年…|報到中國人壽…」）：
+   → 依表格**實際畫出的直線**切開；表格線本身（| [ ]）丟掉；量測文字前先把表格線塗掉。
+3. 掃描稍微歪斜（約 0.4°）時表格完全偵測不到；粗體字的筆畫被當成表格線（一個表格變 35 欄）。
+   → 線的粗細改用「墨量／長度」；筆畫兩側有墨的不是表格線；落在已辨識文字內的筆畫不是表格線；Logo、粗字不當成底色格。
+4. 標點：中文旁的 `, : ; ! ?` 轉全形。
+5. 清單符號：同一欄多數行以 ※ 開頭時，誤讀成 K、HK、*、了 的改回 ※；Word 保留 ※ 而不是換成圓點。
+6. 字級：同一份清單被估成 9–12 pt → 以中文字距推算並對齊頁面常用字級。
+7. 文字型 PDF：窄字（1）的緊框造成數字被拆開（`1 1 7`）→ 用字寬（advance）判斷空格；字級不同且有間距時分成不同區塊。
+8. 轉 Word：標題樣式的斜體不外漏；頁底留一點空間避免最後一列被擠到下一頁。
+
+**仍存在（Tesseract 模型本身的辨識錯誤）**：吳秉儒→RKB、團膳→團騰、繳→緻、年→£、Logo 讀成 Cd、手寫簽名與日期變亂碼。
+tessdata_best 在此樣本反而較差（CER 13.8%、慢 2.4 倍），維持 fast。下一步若要再提升，是試 PP-OCRv5（RapidOCR，需使用者同意新增套件與模型檔約數十 MB）。
