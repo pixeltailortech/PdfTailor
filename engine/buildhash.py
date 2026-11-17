@@ -16,7 +16,8 @@ def files(kind: str) -> list[str]:
     out = [os.path.join(HERE, "requirements.txt")]
     if kind == "req":
         return out
-    out += [os.path.join(HERE, "run_engine.py"), os.path.join(HERE, "build-engine.cmd")]
+    out += [os.path.join(HERE, "run_engine.py"), os.path.join(HERE, "build-engine.cmd"),
+            os.path.join(HERE, "version_info.txt")]
     roots = ["pdftailor_engine"] + (["tests"] if kind == "tests" else [])
     for root in roots:
         for d, dirs, names in os.walk(os.path.join(HERE, root)):

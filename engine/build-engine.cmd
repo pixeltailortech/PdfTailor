@@ -111,6 +111,7 @@ rem  Excluded modules are never imported by the engine; PyInstaller only found t
 rem  through optional imports inside other packages (scipy alone was 68 MB).
 "%VPY%" -m PyInstaller --noconfirm --onedir --console ^
   --name pdftailor-engine ^
+  --version-file "%~dp0version_info.txt" ^
   --distpath "%~dp0dist" --workpath "%~dp0build" ^
   --collect-all pypdfium2 --collect-all pypdfium2_raw ^
   --collect-data reportlab --collect-submodules reportlab ^

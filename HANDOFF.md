@@ -657,3 +657,16 @@ tessdata_best 在此樣本反而較差（CER 13.8%、慢 2.4 倍），維持 fas
 - `MainWindow.xaml` 頂端改為兩列：第 1 列＝功能欄開關、標題、開啟 PDF、頁碼導覽、縮放；右側固定「已修改／塗改」計數與「預覽並輸出」（右側先停靠，寬度不足時也不會被擠掉；計數文字過長會以…截斷）。
   第 2 列 `EditTools`（WrapPanel，寬度不足時整組換行而不是被切掉）＝「辨識」組（重新辨識此頁、最高精度辨識）與「塗改」組（框選塗改區域、填滿方式、清除此頁塗改）。
 - `MainWindow.Merge.cs`：切換到其他功能頁時連同 `EditTools` 一起隱藏。改動前的 XAML 備份在 `_sync\MainWindow.xaml.bak-20261117`。未編譯驗證。
+
+### 2026-11-17：第三方授權聲明與作者署名
+
+- 新增 `tools/notices.py`：讀 `engine/build/pdftailor-engine/PYZ-00.toc` 與 `engine/dist/.../_internal` 判斷實際打包的 Python 套件，
+  複製各 wheel 附的授權檔，加上 Python 執行環境、PyInstaller bootloader、PP-OCR 模型、Tesseract（含 MSYS2 DLL 授權對照表）、
+  .NET 執行環境與 NuGet 套件，產生 `THIRD_PARTY_NOTICES.md` 與 `licenses\`。
+- `release.cmd publish` 最後一步自動執行（用 `engine\.venv-build` 的 Python），輸出到 `publish\`，並刷新 repo 根目錄的
+  `THIRD_PARTY_NOTICES.md`（只有清單，不含原文）。產生失敗只警告，不中斷發佈。
+- 通用授權原文：`tools/license-texts/`（Apache-2.0、GPL/LGPL、MPL、MIT、GCC 例外）。
+- 作者署名：`PdfTailor.csproj` 加 Product/Authors/Copyright/Description；引擎 exe 用 `engine/version_info.txt`
+  （PyInstaller `--version-file`，已列入 buildhash，改它會觸發重建）。
+- 待核對：Tesseract DLL 授權是依上游專案整理（未附原檔），含 LGPL 與 JBIG-KIT（GPL-2.0+）；只在公司內部使用影響小，
+  對外散布前要核對，或考慮拿掉 Tesseract（現在主要用 PP-OCR）。PP-OCRv6 medium 模型授權請再對照官方模型頁。

@@ -1,0 +1,17 @@
+# PyInstaller --version-file: the Windows "Details" tab of pdftailor-engine.exe.
+VSVersionInfo(
+  ffi=FixedFileInfo(filevers=(0, 1, 0, 0), prodvers=(0, 1, 0, 0), mask=0x3f, flags=0x0,
+                    OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([StringTable('040404B0', [
+      StringStruct('CompanyName', 'LouisWu'),
+      StringStruct('FileDescription', 'PdfTailor 轉換引擎'),
+      StringStruct('FileVersion', '0.1.0'),
+      StringStruct('InternalName', 'pdftailor-engine'),
+      StringStruct('LegalCopyright', 'Copyright © 2026 LouisWu（吳秉儒）. All rights reserved.'),
+      StringStruct('OriginalFilename', 'pdftailor-engine.exe'),
+      StringStruct('ProductName', 'PdfTailor'),
+      StringStruct('ProductVersion', '0.1.0')])]),
+    VarFileInfo([VarStruct('Translation', [0x0404, 1200])])
+  ]
+)

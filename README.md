@@ -89,3 +89,12 @@ python -m pytest tests -q
 ```
 
 開發狀態與完整設計說明：見 `HANDOFF.md`。
+
+## 版權與第三方授權
+
+Copyright © 2026 LouisWu（吳秉儒）. All rights reserved.
+
+程式內含的開源元件與其授權列在 `THIRD_PARTY_NOTICES.md`。`release.cmd publish`
+會依實際打包內容重新產生這份清單，連同各元件授權原文（`licenses\` 資料夾）一起放進
+`publish\`，散布給同事時請整個 `publish\` 資料夾一起提供，不要只拿 exe。
+產生器是 `tools/notices.py`，通用授權原文放在 `tools/license-texts/`。

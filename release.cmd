@@ -146,6 +146,23 @@ if not exist "%OUTDIR%\engine\pdftailor-engine.exe" (
   echo [ERROR] "%OUTDIR%\engine\pdftailor-engine.exe" is missing - run: release.cmd engine
   exit /b 1
 )
+call :step_notices
+exit /b 0
+
+:step_notices
+rem  Third-party licence notices next to the exe (publish\THIRD_PARTY_NOTICES.md
+rem  and publish\licenses\), generated from what the build really contains.
+set "NPY=%~dp0engine\.venv-build\Scripts\python.exe"
+if not exist "%NPY%" (
+  echo WARNING: engine\.venv-build missing - third-party notices not written. Run: release.cmd engine
+  exit /b 0
+)
+"%NPY%" "%~dp0tools\notices.py" "%OUTDIR%" > "%STEP%" 2>&1
+set "RC=%ERRORLEVEL%"
+type "%STEP%"
+type "%STEP%" >> "%LOG%"
+if not "%RC%"=="0" echo WARNING: third-party notices could not be written, see release-log.txt.
+"%NPY%" "%~dp0tools\notices.py" "%~dp0." --md-only >> "%LOG%" 2>&1
 exit /b 0
 
 :step_test
