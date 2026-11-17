@@ -40,6 +40,8 @@ from .geometry import PageGeometry, Rect
 from .models import Edit, Run, TextStyle
 from .pdfio import PdfDoc
 from .redact import _inherited, flate_stream, redact_page
+from .erase import Erase, erase_on_page
+from .scanlook import splice_line
 
 SYNTH_ITALIC_SHEAR = math.tan(math.radians(12))
 SYNTH_BOLD_STROKE = 0.035  # of the font size
@@ -54,6 +56,8 @@ class ExportReport:
     blocks_written: int = 0
     runs_removed: int = 0
     notes: list[dict] = field(default_factory=list)  # {"block": id, "page": n, "note": str}
+    erased: int = 0  # boxes whose content was rewritten out of the file
+    erase_covered: int = 0  # boxes that could only be covered
 
     def note(self, edit: Edit, msg: str) -> None:
         self.notes.append({"block": edit.id, "page": edit.page, "note": msg})
@@ -65,6 +69,8 @@ class ExportReport:
             "blocksWritten": self.blocks_written,
             "runsRemoved": self.runs_removed,
             "notes": self.notes,
+            "erased": self.erased,
+            "eraseCovered": self.erase_covered,
         }
 
 
@@ -247,9 +253,23 @@ def _room(edit: Edit, others: list[Edit], geom: PageGeometry) -> tuple[float, fl
     return min(left, b.x), max(right, b.right)
 
 
+def _can_splice(e: Edit) -> bool:
+    """A plain text change on a scanned line: the untouched characters can keep their pixels."""
+    return (
+        e.source == "ocr"
+        and e.fill_mode == "auto"
+        and not e.style_dirty
+        and e.align == "left"
+        and e.bounds == e.original_bounds
+        and e.text != e.original_text
+        and bool(e.text.strip())
+        and bool((e.original_text or "").strip())
+    )
+
+
 def _draw_text(
     c, geom: PageGeometry, edit: Edit, lay: _Layout, emb: Embedder, report: ExportReport, ref: _Layout,
-    room: tuple[float, float],
+    room: tuple[float, float], invisible: bool = False,
 ) -> None:
     b = edit.bounds
     ink_w = lay.ink_x1 - lay.ink_x0
@@ -287,7 +307,9 @@ def _draw_text(
             t.setTextTransform(hscale, 0, shear, 1, pen * hscale, 0)
             t.setHorizScale(100.0)
             c.setFillColorRGB(r, g, bl)
-            if p.seg.synth_bold:
+            if invisible:
+                t.setTextRenderMode(3)  # the letters are already in the patch; this is for search and copy
+            elif p.seg.synth_bold:
                 c.setStrokeColorRGB(r, g, bl)
                 c.setLineWidth(st.size * SYNTH_BOLD_STROKE)
                 t.setTextRenderMode(2)
@@ -337,8 +359,13 @@ def write_edits(
     out_path: str,
     fonts: FontIndex | None = None,
     doc: PdfDoc | None = None,
+    erases: list[Erase] | None = None,
 ) -> ExportReport:
     from reportlab.pdfgen import canvas as rl_canvas
+
+    erase_by_page: dict[int, list[Erase]] = {}
+    for er in erases or []:
+        erase_by_page.setdefault(er.page, []).append(er)
 
     fonts = fonts or default_index()
     doc = doc or PdfDoc(src_path)
@@ -372,7 +399,10 @@ def write_edits(
 
     scale = PATCH_DPI / 72.0
     with pikepdf.open(src_path) as pdf:
-        for page_no in sorted(plans):
+        for page_no in sorted(set(plans) | set(erase_by_page)):
+            if not 1 <= page_no <= len(pdf.pages):
+                continue
+            plans.setdefault(page_no, [])
             info = doc.pages[page_no - 1]
             geom = info.geometry
             page = pdf.pages[page_no - 1]
@@ -391,10 +421,38 @@ def write_edits(
             c = rl_canvas.Canvas(buf, pagesize=(mb.width, mb.height), pageCompression=1)
             c.translate(-mb.left, -mb.bottom)
             page_rgb = None
+            if page_no in erase_by_page:
+                # boxes first: text edited on the same page is drawn over them
+                page_rgb = doc.render(page_no, scale)
+                er_res = erase_on_page(pdf, page, geom, page_rgb, scale, erase_by_page[page_no], c, _paint_patch)
+                report.erased += er_res.removed
+                report.erase_covered += er_res.covered
+                report.runs_removed += er_res.text_runs
+                for n in er_res.notes:
+                    report.notes.append({"block": None, "page": page_no, "note": n})
+            page_all = [o for o in edits if o.page == page_no]
+            spliced: set[int] = set()
             for e, _lay, _ref in plans[page_no]:
                 mode = e.fill_mode
                 if mode == "none":
                     continue
+                if _can_splice(e):
+                    if page_rgb is None:
+                        page_rgb = doc.render(page_no, scale)
+                    try:
+                        sp = splice_line(
+                            page_rgb, scale, e, fonts, None if e.style.family else False,
+                            lambda r, _e=e: _inpaint_patch(page_rgb, scale, r, _e.style.size),
+                            _room(e, page_all, geom)[1],
+                        )
+                    except Exception:  # never lose an export to the cosmetic path
+                        sp = None
+                    if sp is not None:
+                        _paint_patch(c, geom, sp.image, sp.rect)
+                        spliced.add(id(e))
+                        if sp.overflow:
+                            report.note(e, "text-overflow")
+                        continue
                 if mode == "solid":
                     _paint_solid(c, geom, _erase_rect(e), e.fill_color)
                     continue
@@ -404,10 +462,9 @@ def write_edits(
                     img, exact = _inpaint_patch(page_rgb, scale, _erase_rect(e), e.style.size)
                     if img is not None:
                         _paint_patch(c, geom, img, exact)
-            page_all = [o for o in edits if o.page == page_no]
             for e, lay, ref in plans[page_no]:
                 if e.text.strip():
-                    _draw_text(c, geom, e, lay, emb, report, ref, _room(e, page_all, geom))
+                    _draw_text(c, geom, e, lay, emb, report, ref, _room(e, page_all, geom), invisible=id(e) in spliced)
                 report.blocks_written += 1
             c.showPage()
             c.save()

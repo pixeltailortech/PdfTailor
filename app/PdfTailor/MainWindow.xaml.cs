@@ -107,7 +107,7 @@ public partial class MainWindow : Window
 
     private async void OnClosing(object? sender, CancelEventArgs e)
     {
-        if (_blocks.Values.Any(l => l.Any(b => b.Modified)) && !_exported)
+        if ((_blocks.Values.Any(l => l.Any(b => b.Modified)) || EraseCount > 0) && !_exported)
         {
             var r = MessageBox.Show(this, "有尚未輸出的修改，確定要關閉嗎？", "PdfTailor", MessageBoxButton.YesNo, MessageBoxImage.Question);
             if (r != MessageBoxResult.Yes) { e.Cancel = true; return; }
@@ -161,6 +161,7 @@ public partial class MainWindow : Window
             _path = info["path"]!.GetValue<string>();
             _pageCount = info["pageCount"]!.GetValue<int>();
             _pageSize.Clear(); _blocks.Clear(); _pageNotes.Clear(); _exported = false;
+            _erases.Clear(); _eraseSel = null;
             foreach (var p in info["pages"]!.AsArray())
                 _pageSize[p!["page"]!.GetValue<int>()] = (p["width"]!.GetValue<double>(), p["height"]!.GetValue<double>());
             Title = $"PdfTailor — {Path.GetFileName(_path)}";
@@ -186,14 +187,20 @@ public partial class MainWindow : Window
     {
         if (_path == null) return;
         _page = Math.Clamp(page, 1, Math.Max(1, _pageCount));
-        PageLabel.Text = $"{_page} / {_pageCount}";
-        PrevPage.IsEnabled = _page > 1;
-        NextPage.IsEnabled = _page < _pageCount;
+        PageBox.Text = _page.ToString(CultureInfo.InvariantCulture);
+        PageBox.IsEnabled = true;
+        PageLabel.Text = $"/ {_pageCount}";
+        PrevPage.IsEnabled = FirstPage.IsEnabled = _page > 1;
+        NextPage.IsEnabled = LastPage.IsEnabled = _page < _pageCount;
+        _eraseSel = null;
         Select(null);
+        ClearLive();
         await RenderPage();
         if (forceOcr || !_blocks.ContainsKey(_page)) await Analyze(_page, forceOcr);
         DrawOverlay();
+        DrawErases();
         UpdateCounters();
+        ScheduleLive();
     }
 
     private async Task RenderPage()
@@ -226,7 +233,7 @@ public partial class MainWindow : Window
     {
         await Run(forceOcr ? "重新辨識中…" : "分析頁面中…", async ct =>
         {
-            var r = (await _engine.CallAsync("analyze", new JsonObject { ["page"] = page, ["forceOcr"] = forceOcr }, ct))!.AsObject();
+            var r = (await _engine.CallAsync("analyze", new JsonObject { ["page"] = page, ["forceOcr"] = forceOcr, ["quality"] = OcrQuality }, ct))!.AsObject();
             var list = r["blocks"]!.AsArray().Select(b => new BlockVm(b!.AsObject())).ToList();
             foreach (var b in list) b.PropertyChanged += OnBlockChanged;
             _blocks[page] = list;
@@ -262,6 +269,7 @@ public partial class MainWindow : Window
                 var keep = _sel;
                 await RenderPage();
                 DrawOverlay();
+                DrawErases();
                 if (keep != null) Select(keep);
             }
         }
@@ -291,9 +299,9 @@ public partial class MainWindow : Window
         Canvas.SetLeft(host, b.X * k - pad);
         Canvas.SetTop(host, b.Y * k - pad);
 
-        if (b.Modified)
+        if (b.Modified && !LiveShows(b))
         {
-            // WYSIWYG-ish: cover the old line with its paper colour and show the new text.
+            // Stand-in until the engine's own rendering arrives (see MainWindow.Live.cs): cover the old line with its paper colour and show the new text.
             // A Canvas does not clip, so a longer line runs on past its box as it will in
             // the PDF. The exact result comes from the engine's preview.
             host.Children.Add(new Border { Background = new SolidColorBrush(b.Background) });
@@ -419,13 +427,16 @@ public partial class MainWindow : Window
     private void OnBlockChanged(object? sender, PropertyChangedEventArgs e)
     {
         if (sender is BlockVm b && e.PropertyName == nameof(BlockVm.Modified)) UpdateCounters();
+        ScheduleLive();
     }
 
     private void UpdateCounters()
     {
         int n = _blocks.Values.Sum(l => l.Count(b => b.Modified));
-        ModifiedLabel.Text = n > 0 ? $"已修改 {n} 行" : "";
-        ExportButton.IsEnabled = n > 0 && !_busy;
+        int boxes = EraseCount;
+        ModifiedLabel.Text = (n > 0 ? $"已修改 {n} 行" : "") + (n > 0 && boxes > 0 ? "、" : "") + (boxes > 0 ? $"塗改 {boxes} 處" : "");
+        ExportButton.IsEnabled = (n > 0 || boxes > 0) && !_busy;
+        EraseClearButton.IsEnabled = _erases.TryGetValue(_page, out var pageBoxes) && pageBoxes.Count > 0;
         ReOcrButton.IsEnabled = _path != null && !_busy;
     }
 
@@ -564,7 +575,9 @@ public partial class MainWindow : Window
         if (ctrl && e.Key == Key.I && _sel != null) { e.Handled = true; ItalicToggle.IsChecked = !(ItalicToggle.IsChecked == true); OnItalicClick(sender, e); return; }
         if (e.Key == Key.Escape && _busy) { _cts?.Cancel(); e.Handled = true; return; }
         if (e.Key == Key.Escape && _sel != null) { Select(null); e.Handled = true; return; }
-        if (_busy || EditText.IsKeyboardFocusWithin) return;
+        if (ctrl && e.Key == Key.G && _path != null) { e.Handled = true; PageBox.Focus(); return; }
+        if (e.Key == Key.Delete && _eraseSel != null && Keyboard.FocusedElement is not TextBox) { e.Handled = true; DeleteSelectedErase(); return; }
+        if (_busy || EditText.IsKeyboardFocusWithin || PageBox.IsKeyboardFocusWithin) return;
         if (e.Key == Key.PageDown) { e.Handled = true; await GoTo(_page + 1); }
         if (e.Key == Key.PageUp) { e.Handled = true; await GoTo(_page - 1); }
     }
@@ -592,13 +605,15 @@ public partial class MainWindow : Window
     {
         if (_busy || _path == null) return;
         var edits = CollectEdits(out int n);
-        if (n == 0) { MessageBox.Show(this, "還沒有任何修改。", "PdfTailor"); return; }
+        var erases = CollectErases();
+        if (n == 0 && erases.Count == 0) { MessageBox.Show(this, "還沒有任何修改。", "PdfTailor"); return; }
+        n += erases.Count;
 
         List<PreviewPage>? pages = null;
         List<string> notes = new();
         await Run("產生預覽中…", async ct =>
         {
-            var pv = (await _engine.CallAsync("preview", new JsonObject { ["edits"] = edits.DeepClone(), ["dpi"] = 120 }, ct))!.AsObject();
+            var pv = (await _engine.CallAsync("preview", new JsonObject { ["edits"] = edits.DeepClone(), ["erases"] = erases.DeepClone(), ["dpi"] = 120 }, ct))!.AsObject();
             pages = new List<PreviewPage>();
             foreach (var img in pv["images"]!.AsArray())
             {
@@ -629,7 +644,7 @@ public partial class MainWindow : Window
         {
             result = (await _engine.CallAsync("export", new JsonObject
             {
-                ["edits"] = edits.DeepClone(), ["out"] = outPath, ["verify"] = true,
+                ["edits"] = edits.DeepClone(), ["erases"] = erases.DeepClone(), ["out"] = outPath, ["verify"] = true,
                 ["audit"] = makeAudit, ["auditText"] = auditText,
             }, ct))!.AsObject();
         });
@@ -653,6 +668,7 @@ public partial class MainWindow : Window
                 var s when s.StartsWith("font-missing:") => $"這台電腦沒有字型「{s[13..]}」，已改用最接近的字型。",
                 var s when s.StartsWith("chars-missing:") => $"字型缺少這些字元，可能顯示為方框：{s[14..]}",
                 "text-overflow" => "有一行新文字比原本長很多，已略為壓縮仍超出範圍。",
+                "erase-covered-only" => "這一頁有塗改區域只能蓋住、無法把原內容從檔案移除（該處不是掃描影像，例如文字或線條）。",
                 _ => note,
             };
             var line = $"第 {page} 頁：{text}";

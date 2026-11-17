@@ -271,11 +271,35 @@ def _first_token_width(line: Line) -> float:
     return n * avg + 0.3 * line.size
 
 
-def _starts_new(acc: _Acc, cur: Line, R: float) -> bool:
+def _usual_pitch(lines: list[Line]) -> float | None:
+    """The line spacing this run of text is set with, in pt, or None when it cannot be told.
+
+    Taken from neighbouring lines of the same size; the lower-middle value, so the larger
+    gaps between paragraphs do not count.
+    """
+    ps: list[float] = []
+    for a, b in zip(lines, lines[1:]):
+        size = max(a.size, b.size)
+        p = b.cy - a.cy
+        if abs(a.size - b.size) <= max(0.6, 0.06 * size) and 0.9 * size <= p <= 3.4 * size:
+            ps.append(p / size)
+    if len(ps) < 3:
+        return None
+    ps.sort()
+    return ps[int(0.4 * (len(ps) - 1))]
+
+
+def _starts_new(acc: _Acc, cur: Line, R: float, usual: float | None = None) -> bool:
     prev = acc.lines[-1]
     size = max(prev.size, cur.size)
     pitch = cur.cy - prev.cy
-    if pitch > 1.75 * size + 1.0 or pitch < 0.55 * size:
+    # Single-spaced text sits about 1.2-1.5 sizes apart, so 1.75 separates paragraphs —
+    # unless the document itself is set wider (1.5 or double line spacing), where every
+    # line would otherwise become a paragraph of its own.
+    limit = 1.75 * size + 1.0
+    if usual is not None:
+        limit = max(limit, 1.3 * usual * size)
+    if pitch > limit or pitch < 0.55 * size:
         return True
     if abs(prev.size - cur.size) > max(0.6, 0.06 * size):
         return True
@@ -310,9 +334,10 @@ def build_paragraphs(lines: list[Line], L: float, R: float, in_cell: bool = Fals
     if not lines:
         return []
     groups: list[_Acc] = []
+    usual = _usual_pitch(lines)
     for ln in lines:
         mk = match_marker(ln.text)
-        if groups and not _starts_new(groups[-1], ln, R):
+        if groups and not _starts_new(groups[-1], ln, R, usual):
             groups[-1].lines.append(ln)
         else:
             groups.append(_Acc([ln], mk))
@@ -333,6 +358,52 @@ def _squeeze_cjk_spaces(runs: list[Run]) -> None:
         r.text = "".join(ch for ci, ch in enumerate(r.text) if (ri, ci) not in drop)
 
 
+def _unify_scanned(runs: list[Run]) -> None:
+    """One typeface and one size per paragraph for text measured from a scan.
+
+    Family and size of scanned lines are estimates; small disagreements between the
+    lines of one paragraph are measuring noise, and in Word they show as a patchwork.
+    Runs of the same script take the paragraph's commonest family, and sizes within 15%
+    of the commonest size take that size. Bold, italic and colour are left as measured;
+    text read from a real text layer is never touched.
+    """
+    from collections import Counter
+
+    def script(r: Run) -> str:
+        return "cjk" if sum(_wide(c) for c in r.text) >= 2 else "latin"
+
+    scanned = [r for r in runs if r.style.source == "measured" and r.text.strip()]
+    if len(scanned) < 2:
+        return
+    fam: dict[str, Counter] = {"cjk": Counter(), "latin": Counter()}
+    size: Counter = Counter()
+    for r in scanned:
+        n = len(r.text.strip())
+        if r.style.family:
+            fam[script(r)][r.style.family] += n
+        size[round(r.style.size * 2) / 2] += n
+    # the Latin companion font of the Chinese text: one per paragraph as well
+    latin: Counter = Counter()
+    for r in scanned:
+        if script(r) == "cjk":
+            latin[r.style.latin_family] += 1 + sum(1 for c in r.text if c.isascii() and c.isalnum())
+    top_latin = latin.most_common(1)[0][0] if latin else None
+    top_size = size.most_common(1)[0][0]
+    top_fam = {k: (v.most_common(1)[0][0] if v else None) for k, v in fam.items()}
+    for r in runs:
+        if r.style.source != "measured":
+            continue
+        st = r.style
+        f = top_fam[script(r)] if r.text.strip() else None
+        if f and st.family != f:
+            st = st.with_(family=f)
+        if r.text.strip() and script(r) == "cjk" and st.latin_family != top_latin:
+            st = st.with_(latin_family=top_latin)
+        if st.size != top_size and 0.85 <= st.size / top_size <= 1.15:
+            st = st.with_(size=top_size)
+        r.style = st
+
+
 def _finish(acc: _Acc, L: float, R: float, in_cell: bool) -> Para:
     lines = acc.lines
     runs: list[Run] = []
@@ -342,6 +413,7 @@ def _finish(acc: _Acc, L: float, R: float, in_cell: bool) -> Para:
         runs.extend(Run(r.text, r.style, r.x0, r.x1) for r in ln.runs)
 
     _squeeze_cjk_spaces(runs)
+    _unify_scanned(runs)
     first = lines[0]
     size = _dominant_size(runs)
     para = Para(

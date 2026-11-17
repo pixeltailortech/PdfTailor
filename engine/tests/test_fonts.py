@@ -39,8 +39,9 @@ def test_office_script_split(fonts):
 
 
 def test_missing_family_falls_back_and_notes(fonts):
-    r = fonts.resolve(TextStyle(family="Calibri", bold=True), "Total 金額")
-    assert "font-missing:Calibri" in r.notes
+    # a family no machine has (Calibri itself is installed on Windows)
+    r = fonts.resolve(TextStyle(family="PdfTailor Missing Sans", bold=True), "Total 金額")
+    assert "font-missing:PdfTailor Missing Sans" in r.notes
     assert all(s.face.bold for s in r.segments)  # real bold faces, nothing synthesised
     assert not any(s.synth_bold for s in r.segments)
 

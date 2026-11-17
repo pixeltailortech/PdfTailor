@@ -510,3 +510,150 @@ D:\AI\Project\PdfTailor
 
 **仍存在（Tesseract 模型本身的辨識錯誤）**：吳秉儒→RKB、團膳→團騰、繳→緻、年→£、Logo 讀成 Cd、手寫簽名與日期變亂碼。
 tessdata_best 在此樣本反而較差（CER 13.8%、慢 2.4 倍），維持 fast。下一步若要再提升，是試 PP-OCRv5（RapidOCR，需使用者同意新增套件與模型檔約數十 MB）。
+
+
+---
+
+## 追加（2026-11-12）：建置加速（release.cmd 選 3 原本約 3.5 分鐘）
+
+實測耗時：PyInstaller 約 150 秒（每次 `--clean` 從頭分析，還把沒用到的 scipy 一起打包）、pip 檢查、測試、dotnet publish 約 40 秒。
+`engine/build-engine.cmd` 改為依 `engine/buildhash.py` 的指紋跳過沒變的步驟：requirements 沒變不跑 pip；程式與測試沒變且上次通過不跑測試；
+引擎原始碼沒變且 `publish\engine` 已有 exe 就不跑 PyInstaller；Tesseract 已在就不重複複製。指紋存在 `engine\build\*.sha`、`.venv-build\req.sha`。
+移除 `--clean`、排除 scipy／pytest 等未使用模組、刪掉 OpenCV 的 FFmpeg 影片外掛（約 30 MB）；requirements 拿掉沒用到的 scipy。
+測試改成跑完全部（不再 `-x` 遇到第一個失敗就停）。強制完整重建：`release.cmd clean`，或設 `PDFTAILOR_FULL_BUILD=1`。
+
+
+---
+
+## 追加（2026-11-12 下午）：掃描頁「改字不留痕」與字型一致
+
+使用者回報：編輯掃描 PDF 的一行字後，整行變成另一種字型（新細明體），和段落不一致；轉 Word 時同一段落每行字型不同。
+
+**原因**
+1. `fontmatch` 每一行各自猜字型，相似字型之間每行結果不同（實測同段落會在明體／黑體間跳）。
+2. 粗體行：沒有粗體檔的字型（標楷體）用細體去比，永遠輸給有真粗體檔的字型（微軟正黑體 Bold）。
+3. 改字時整行用向量字重畫：就算字型猜對，筆畫比掃描銳利、OCR 漏掉的空格也消失，整行位置都變。
+4. **既有 bug**：同一個引擎程序第二次輸出時，reportlab 以「字型名稱」重用第一次的子集字型，新字全部變成空白方框（`fonts.py` `Embedder.name` 已修，清掉 `pdfmetrics._dynFaceNames` 的舊項目）。
+
+**修正（引擎，pytest 144 項全過，新增 `tests/test_scanlook.py`）**
+- `fontmatch.score_fonts` / `settle_families`：字型改成「同一群行一起決定」（同文字系統、粗細、斜體、字級相近為一群），並向整頁的結果靠攏（`PRIOR_WEIGHT`=80 個字）。含兩個以上中文字的行一律用中文字型（英數用該字型自己的字形，如標楷體）。純英文行的候選也加入該頁的中文字型。
+- `fontmatch._render`：沒有粗體檔的字型以描邊合成粗體後再比對。
+- **新模組 `scanlook.py`（`splice_line`）**：掃描行只改文字時不再整行重畫——
+  - 新舊文字相同的開頭與結尾**保留原本的像素**（在掃描圖上用改動處兩側各 4 個字做樣板比對定位，字級在 ±6% 內微調）；
+  - 只畫被改的字，而且是畫成**點陣**：筆畫粗細、邊緣模糊、墨色、雜訊都從該行量出來（`fit_look`）；
+  - 新字比舊字長／短時，後半段原像素整段平移；中英文之間的細空格依 Word 習慣保留或移除；
+  - 新文字另以不可見文字（render mode 3）寫入，搜尋／複製仍然找得到。
+  - 條件（`writer._can_splice`）：掃描行、背景為「自動修補」、沒改樣式、沒移動位置、靠左。其餘情況走原本的向量重畫。定位失敗時自動退回整行重畫。
+- `docstruct._unify_scanned`：轉 Word 時同一段落（掃描來源）統一字型，字級相差 15% 內統一字級；有文字層的 PDF 不動。
+
+**尚未做／限制**
+- 尚未用使用者的實際檔案（標楷體掃描）在 Windows 實測；容器沒有標楷體，以 Noto Serif/Sans 驗證邏輯。
+- 中文用標楷體、英數用 Times New Roman 這種「雙字型」目前仍以單一 family 表示（英數會用中文字型自己的字形）。
+- 改了字型／字級／顏色或移動過的行仍是向量重畫，沒有掃描質感。
+- `verify_output` 在合成掃描上本來就會回報 1–5 個「框外像素」（修改前就有），未處理。
+
+### 同日第二輪（使用者回報：改字後畫面上仍變新細明體，疑與粗體／斜體行有關；轉 Word 偶爾跑版）
+
+- **編輯畫面的「已修改行」本來是 WPF 自己用近似字型畫的替身**（`MainWindow.MakeVisual`），不是引擎的結果，所以改字時畫面必然和掃描不同，改回原文才恢復。
+  新增 `app/PdfTailor/MainWindow.Live.cs`：改字後 0.45 秒向引擎要一次 `preview`（只算當頁、與畫面同 DPI），把結果放在新的 `LiveImage`（`MainWindow.xaml`，疊在 `PageImage` 上），
+  該行的替身就不再畫（`LiveShows`）。**這段 C# 未經編譯驗證**（容器沒有 dotnet），第一次 `release.cmd` 若編譯失敗請看錯誤訊息修正。
+- **中英雙字型**：`TextStyle.latin_family`（JSON `latinFamily`）＝中文行裡英數字用的另一個字型（例：標楷體＋Times New Roman）；None 表示英數用中文字型自己的字形。
+  `fontmatch.score_latin` 以「中文用已定字型、英數用候選字型」合成後比對，同字型同字級一群一起決定。`fonts.resolve`、`docxout._set_fonts`（ascii/hAnsi 與 eastAsia 分開）、`docstruct._unify_scanned` 都已支援。
+  WPF 送回的 style 沒有 `latinFamily`，`Session._edits` 會在 family 沒被改時從分析結果補回。
+- 字型分群不再看粗體／斜體（只看文字系統與字級）；中文行投票的權重只算中文字數，避免「（英文原文：…斜體英文」這種行把整群拉向英文字形相近的中文字型。
+- `scanlook.fit_look`：限制 `tau >= width/2`，否則沒有字的地方也會被染灰（新字周圍出現灰底方塊）。
+- **轉 Word**：分段原本固定以「行距 > 1.75 倍字級」當作新段落，1.5 倍或 2 倍行高的文件每行都被拆成一段。改為依該區塊實際行距判斷（`docstruct._usual_pitch`）。
+- 引擎 pytest 146 項全過。仍未用使用者的標楷體實檔驗證；曾嘗試請求讀取 `C:\Windows\Fonts` 做本機模擬，被權限機制拒絕。
+
+### 同日第三輪：小字、低解析度合約掃描（使用者回報：中文整行變英文亂碼、段落與對齊全亂）
+
+- 以模擬頁重現（`/tmp/small.py`，未入庫）：英文 6.5 pt＋中文 7 pt、來源 100 dpi → Tesseract 中文正確率 **約 7%**（整行被讀成 `SRARNERAREA A - SRR RARRE` 這類大寫亂碼，且信心值 ≥ 88），英文約 84%；
+  同一頁 7.5 pt／110 dpi → 中文 97%。也就是 Tesseract 在中文字高約 10 px 以下會斷崖式失效。
+- 試過且**無效**（已全部撤回，`scanpage.py`、`ocr/tesseract.py` 維持原樣）：整頁放大（300→400/500 dpi）、銳化、對比拉伸、只用 chi_tra 重讀可疑行（單行或整頁第二遍）。只用 chi_tra 整頁可到 48–77%，但不穩定，逐行套用後沒有改善。
+- 段落與對齊錯亂是辨識失敗的連帶結果（行框不準、行首缺字），不是分段規則本身的問題；辨識修好前不宜再調 `docstruct`。
+- **建議的下一步（需使用者同意才下載）**：以 RapidOCR（onnxruntime）＋ PP-OCRv5 模型取代或並用 Tesseract。偵測模型約 84 MB、中文辨識模型約 81 MB，Apache 2.0，可完全離線。
+  接法：新增 `ocr/rapid.py` 實作 `OcrEngine`（`recognize_page` 回傳行框＋文字），`service._ocr_engine` 的 `auto` 在模型存在時優先使用；`build-engine.cmd` 把模型複製到 `publish\engine\models`。
+  版面模型（PP-StructureV3 的 PP-DocLayout）可作為第二階段，用來判斷標題／段落／表格區塊。
+- 不建議：Marker（GPL-3.0）、PyMuPDF 系（AGPL，與本專案授權原則衝突）；MinerU／Docling 主要輸出 Markdown/JSON，不直接產生保留版面的 Word。
+
+### 同日第四輪：接入 PP-OCRv5（使用者授權由 AI 決定模型）
+
+- **決定**：只用 PP-OCRv5 的 **server 偵測＋server 辨識** 兩個模型（一個辨識模型涵蓋繁中／簡中／英／日），不放 mobile 版、不放其他語系、不放文字方向分類器。Tesseract 保留為備援。
+- 新增 `engine/pdftailor_engine/ocr/rapid.py`（`RapidOcr`，走 `rapidocr>=3` + onnxruntime）：偵測出的片段依同一列、間距 < 1.6 倍字高併回一行，並產生近似的逐字框供表格線切割。
+  `Session._ocr_engine("auto")` 先試 PP-OCRv5（套件或模型不存在就安靜退回 Tesseract）；`Session._read_scan` 在 PP-OCRv5 執行失敗時該頁改用 Tesseract 並在備註說明。
+  每頁分析備註最後會寫「辨識引擎：pp-ocrv5／tesseract」，可用來確認實際用到哪個。環境變數 `PDFTAILOR_OCR=tesseract|rapid` 可強制指定。
+- 模型位置（依序）：`PDFTAILOR_OCR_MODELS`、引擎旁的 `models\`、原始碼的 `vendor\ocr-models\`（已加入 .gitignore）。
+- 建置：`engine/requirements-ocr.txt`（rapidocr、onnxruntime，**選用**，裝不起來不會讓建置失敗）；`build-engine.cmd` 新增三段——安裝 OCR 套件（成功後寫 `.venv-build\ocr.ok`）、
+  第一次自動下載模型到 `vendor\ocr-models`（`python -m pdftailor_engine.ocr.rapid --fetch`）、PyInstaller 加 `--collect-all rapidocr --collect-all onnxruntime`、把模型複製到 `publish\engine\models`。
+  原本的 cmd 備份在 `_sync\build-engine.cmd.bak-20261112`。
+- 比較工具：`python -m pdftailor_engine.ocr.rapid 檔案.pdf 頁碼` 會印出兩個引擎各自讀到的文字與信心值。
+- **未驗證**：容器連不到 PyPI／模型站，`rapid.py` 只用「相同呼叫介面的替身」測過流程（片段合併、備援、備註），沒有跑過真正的 PP-OCRv5。
+  最可能要調整的地方：`_fetch` 依檔名（含 v5、det/rec）找下載的模型；`RapidOCR(params=…)` 的參數名稱若版本不同會自動退回精簡參數。引擎 pytest 150 項全過。
+
+### 2026-11-13：使用者實測「準確度和改版前差不多」——原因與修正
+
+- **原因（已由檔案與建置紀錄確認）**：使用者測到的仍是 Tesseract。`vendor\ocr-models` 與 `publish\engine\models` 裡只有偵測模型 `ch_PP-OCRv5_det_server.onnx`，沒有辨識模型；
+  兩個模型缺一，`RapidOcr` 就回報無法使用，`auto` 模式安靜退回 Tesseract。
+  辨識模型沒下載的原因是 `_fetch` 的暖機圖是一張空白圖：RapidOCR 3.10 的模型是用到才載入（lazy），偵測不到文字就不會去載入、下載辨識模型（建置紀錄：`The text detection result is empty`）。
+- **修正**：`_fetch` 改用有文字的暖機圖，並用 `Global.model_root_dir` 讓模型直接下載到 `vendor\ocr-models`；`build-engine.cmd` 改成檢查 `*rec*.onnx` 是否存在。
+  退回 Tesseract 時，頁面備註會多一行「PP-OCR 未啟用：原因」，不再安靜退回。
+- **模型改選 PP-OCRv6 medium**（偵測＋辨識）：RapidOCR 3.10 已支援，官方數據高於 PP-OCRv5 server。`find_models` 依檔名排序：v6 medium > v5 server > v6 small > v5 mobile > v6 tiny，偵測與辨識各自挑最好的。
+  舊的 `ch_PP-OCRv5_det_server.onnx` 已移到 `_to_delete\`。
+- 另外調整：`Global.max_side_len` 與 `Det.limit_side_len` 設為 3600（RapidOCR 預設會把頁面縮到長邊 2000，小字會更糊）；`Global.text_score` 0.5 → 0.2（預設會直接丟掉低信心的行）。
+- 已對照 `rapidocr 3.10.0` 原始碼確認：參數鍵名、`__call__(use_det/use_cls/use_rec)`、輸出欄位 `boxes/txts/scores`、ONNX 模型內含字典。仍未實際執行過模型（容器裝不了 pyclipper／shapely，也連不到模型站）。引擎 pytest 151 項全過。
+
+### 2026-11-13 下午：轉 Word 6 頁要好幾分鐘 → 辨識改成「小模型全讀＋中模型複核」
+
+- **原因（以實際模型在容器 2 核心上量測，7 pt／100 dpi 密集頁，40 行）**：medium 辨識模型每頁約 130 秒（耗時與文字總長成正比，切行、改批次都沒用）；medium 偵測在長邊 2496 時 55 秒（原設定 3600，更久）。
+  使用者電腦是 i3-1220P，6 頁密集文件因此要數分鐘。字型判斷只佔約 1–2 秒，不是主因。
+- **量測結果（同一頁）**：
+
+  | 做法 | 耗時 | 英數正確率 | 中文正確率 |
+  |---|---|---|---|
+  | Tesseract | 約 8 秒 | 84% | 7% |
+  | medium 偵測＋medium 辨識（上一版） | 約 165–240 秒 | 98.5–99.5% | 91.5–93.0% |
+  | small 偵測＋small 辨識 | 約 7 秒 | 99.4% | 88.3% |
+  | small 全讀，信心 < 0.95 的行用 medium 重讀，再做繁體修正（**現行**） | 約 35 秒 | 99.4% | 94.8% |
+
+  一般清晰頁（7.5 pt／150 dpi）small 就是 100%／100%，medium 完全不會被叫到，約 7 秒。
+- **另一個發現**：medium 辨識模型對某些很長的小字英文行會整行讀錯（信心值同時很低），small 沒有這個問題；所以「兩者取信心高者」比全部用 medium 還準。
+- **實作**（`ocr/rapid.py`）：`_fast`＝small 偵測＋small 辨識（檔案來自 rapidocr 套件自帶的 `models\`，PyInstaller 已一併打包）；`_best`＝medium。
+  `SURE = 0.95`、`DET_SIDE = 2496`。`PDFTAILOR_OCR_QUALITY=max` 可強制全部用 medium。引擎名稱顯示為「PP-OCRv6 small + medium」。
+- **繁體修正**：模型偶爾把模糊的繁體字讀成簡體（组、细、来）。整頁以繁體為主時，把「只有一種繁體對應、且本身不是繁體用字」的簡體字換回繁體（約 490 字的對照表，`_SIMP`/`_TRAD`）；后、里、干、历、并、范等一對多的字不處理。
+- 字型判斷：每群只量最長的 12 行（`FONT_LINES`），其餘行沿用該群結果與字級修正比例。
+- 引擎 pytest 152 項全過。`rapid.py` 的兩段式流程仍只用替身測過呼叫流程；正確率與耗時的數字是直接用 onnxruntime 跑模型量的，前後處理是我自己照 rapidocr 原始碼寫的簡化版，和實際管線可能有小差異。
+
+### 2026-11-13 傍晚：「最高精度辨識（較慢）」勾選框
+
+- 使用者要求：全部用大模型做成可勾選的功能；不勾選（預設）＝輕量模型全讀＋沒把握的行由大模型複核。
+- 引擎：`analyze` 與 `docx` 指令多一個參數 `quality`（`"auto"`／`"max"`，預設 auto）。`RapidOcr.max_quality` 由 `Session._ocr_engine` 每次設定；
+  `Session.page_quality[page]` 記下每個掃描頁是用哪種方式讀的。轉 Word 時，若該頁先前用另一種方式讀過、且沒有帶修改，會以新方式重讀；帶有修改的頁不重讀（修改是對應原本那次辨識的行）。
+- WPF（**未編譯驗證**）：`MainWindow.xaml` 新增 `QualityBox`（編輯 PDF 工具列，「重新辨識此頁」右邊）與 `WordQualityBox`（轉 Word 頁，「套用已修改的文字」下方），兩者同步；
+  `MainWindow.Live.cs` 的 `_maxQuality`／`OcrQuality`／`OnQualityToggled`；`analyze`、`docx` 呼叫都帶 `quality`。
+  編輯畫面中已辨識過的頁面不會自動重讀，要按「重新辨識此頁」。設定不會存檔，每次開程式預設為不勾選。
+- 引擎 pytest 152 項全過；以替身驗證過 auto／max 切換與轉 Word 的重讀邏輯。
+
+### 2026-11-17：塗改功能、跳頁
+
+**塗改**（使用者需求：掃描原件破損或髒汙，框選後填成白色或相近底色再輸出；選擇「接近底色」為預設、被塗掉的內容要「真的從檔案移除」）
+- 引擎新模組 `erase.py`：`Erase(page, rect, mode, color)`，`mode` 為 `auto`（取方框周圍紙張顏色並加上紙張雜訊）、`white`、`color`。
+  `export`／`preview` 指令多一個參數 `erases`：`[{"page":1,"rect":[x,y,w,h],"mode":"auto"}]`（座標與文字區塊相同，顯示座標 pt）。
+- **真的移除**：頁面內容串直接畫的影像（掃描頁就是這種）會被解碼、把方框內像素換成填色、再重新存回（原本是 JPEG 就以品質 92 重存，其餘以 Flate 無損；1-bit／調色盤影像會轉成 8-bit 灰階或 RGB）。
+  方框內起始的文字（含舊的隱形 OCR 文字層）用既有的 `redact_page` 移除。Resources 可能多頁共用，改寫前會先替該頁複製一份，其他頁不受影響。
+- **只能覆蓋的情況**（`report.eraseCovered`、備註 `erase-covered-only`、稽核紀錄 `eraseRemoved=false`）：頁面有向量繪圖、Form XObject、inline image，或影像是遮罩／無法解碼。這時是蓋一塊圖上去，原內容仍在檔案內。
+- 稽核紀錄：`changes` 多一種 `kinds: ["erase"]`，CSV「動作類型」為「塗改」，「新文」欄寫明已移除或僅覆蓋。`verify_output` 把方框視為允許變動的區域；影像重存後整頁會有細微壓縮差異，改用較高門檻並忽略單點。
+- 試過 `cv2.inpaint` 把周圍長進方框，會把旁邊的文字和線條拖成黑色污跡，已放棄，不提供。
+- 測試 `tests/test_erase.py` 10 項（JPEG／RGB／灰階、旋轉 90/180/270、共用影像的兩頁、文字移除、向量頁、預覽）。引擎 pytest 162 項全過。
+- **未做**：轉 Word 不會理會塗改方框；自訂顏色引擎支援但畫面沒有選色；撤銷只有「選取後 Delete」與「清除此頁塗改」。
+
+**WPF（未編譯驗證）**
+- `MainWindow.Erase.cs`（新）：塗改方框的資料、拖曳繪製、選取刪除，以及跳頁的事件處理。
+- `MainWindow.xaml`：工具列新增「塗改」勾選、填滿方式下拉（接近底色／純白）、「清除此頁塗改」；頁面上新增 `EraseLayer`（塗改模式才接收滑鼠）；
+  頁碼改為可輸入的 `PageBox`（Enter 跳頁、Esc 取消、Ctrl+G 聚焦），加上「«」「»」第一頁／最後一頁。
+- `MainWindow.xaml.cs`：輸出與預覽帶 `erases`；計數、輸出按鈕、關閉提醒都把塗改算進去；Delete 鍵刪除選取的方框。`MainWindow.Live.cs`：即時畫面也帶 `erases`，所以畫完方框約半秒後看到的就是實際填色結果。
+
+**同日：工具列改成兩列（使用者回報右側文字被壓縮、找不到輸出按鈕）**
+- 原本所有控制項擠在同一列，視窗寬度不夠時右邊的「已修改…」和「預覽並輸出」被擠出畫面。
+- `MainWindow.xaml` 頂端改為兩列：第 1 列＝功能欄開關、標題、開啟 PDF、頁碼導覽、縮放；右側固定「已修改／塗改」計數與「預覽並輸出」（右側先停靠，寬度不足時也不會被擠掉；計數文字過長會以…截斷）。
+  第 2 列 `EditTools`（WrapPanel，寬度不足時整組換行而不是被切掉）＝「辨識」組（重新辨識此頁、最高精度辨識）與「塗改」組（框選塗改區域、填滿方式、清除此頁塗改）。
+- `MainWindow.Merge.cs`：切換到其他功能頁時連同 `EditTools` 一起隱藏。改動前的 XAML 備份在 `_sync\MainWindow.xaml.bak-20261117`。未編譯驗證。

@@ -73,7 +73,7 @@ public partial class MainWindow
         JsonObject? result = null;
         await Run("轉成 Word 中…", async ct =>
         {
-            var args = new JsonObject { ["out"] = outPath, ["edits"] = edits.DeepClone() };
+            var args = new JsonObject { ["out"] = outPath, ["edits"] = edits.DeepClone(), ["quality"] = OcrQuality };
             if (pages != null)
             {
                 var arr = new JsonArray();

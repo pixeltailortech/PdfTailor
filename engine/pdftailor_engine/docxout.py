@@ -29,13 +29,13 @@ def _half(pt: float) -> float:
     return max(1.0, round(pt * 2) / 2)
 
 
-def _set_fonts(run, family: str | None, text: str) -> None:
+def _set_fonts(run, family: str | None, text: str, latin_family: str | None = None) -> None:
     rpr = run._r.get_or_add_rPr()
     fonts = rpr.find(qn("w:rFonts"))
     if fonts is None:
         fonts = OxmlElement("w:rFonts")
         rpr.insert(0, fonts)
-    latin = family or LATIN_DEFAULT
+    latin = latin_family or family or LATIN_DEFAULT
     east = family or CJK_DEFAULT
     for attr in ("w:ascii", "w:hAnsi", "w:cs"):
         fonts.set(qn(attr), latin)
@@ -51,7 +51,7 @@ def _add_run(par, r: Run, force_color: bool = False) -> None:
         return
     run = par.add_run(text)
     st = r.style
-    _set_fonts(run, st.family, text)
+    _set_fonts(run, st.family, text, st.latin_family)
     run.font.size = Pt(_half(st.size))
     if st.bold:
         run.font.bold = True

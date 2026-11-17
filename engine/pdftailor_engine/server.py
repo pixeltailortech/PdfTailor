@@ -98,9 +98,10 @@ class Server:
                     ocr_lines=args.get("ocrLines"),
                     force_ocr=bool(args.get("forceOcr", False)),
                     progress=progress,
+                    quality=str(args.get("quality", "auto")),
                 )
             elif cmd == "preview":
-                result = s.preview(args.get("edits", []), args.get("pages"), float(args.get("dpi", 110)))
+                result = s.preview(args.get("edits", []), args.get("pages"), float(args.get("dpi", 110)), erases=args.get("erases"))
             elif cmd == "export":
                 result = s.export(
                     args.get("edits", []),
@@ -108,6 +109,7 @@ class Server:
                     bool(args.get("verify", True)),
                     audit=bool(args.get("audit", True)),
                     audit_text=bool(args.get("auditText", True)),
+                    erases=args.get("erases"),
                 )
             elif cmd == "thumbnails":
                 result = s.thumbnails(args.get("pages"), float(args.get("dpi", 36)), progress=progress)
@@ -120,6 +122,7 @@ class Server:
                     edits=args.get("edits"),
                     ocr=str(args.get("ocr", "auto")),
                     progress=progress,
+                    quality=str(args.get("quality", "auto")),
                 )
             elif cmd == "fonts":
                 result = s.fonts_list()

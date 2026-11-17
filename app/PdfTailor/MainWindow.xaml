@@ -87,7 +87,14 @@
 
         <!-- ===== top bar ===== -->
         <Border Grid.Row="0" Background="#0F1724" BorderBrush="#1E2B40" BorderThickness="0,0,0,1" Padding="16,10">
+            <StackPanel>
+            <!-- row 1: file, page navigation, zoom on the left; what was changed and the export button on the right.
+                 The right side is docked first, so it keeps its place however narrow the window gets. -->
             <DockPanel LastChildFill="False">
+                <StackPanel x:Name="EditRight" DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
+                    <TextBlock x:Name="ModifiedLabel" Text="" Foreground="#9FE9FF" VerticalAlignment="Center" Margin="0,0,14,0" MaxWidth="240" TextTrimming="CharacterEllipsis"/>
+                    <Button x:Name="ExportButton" Content="預覽並輸出" Style="{StaticResource PrimaryButton}" Click="OnPreviewExport" IsEnabled="False"/>
+                </StackPanel>
                 <StackPanel DockPanel.Dock="Left" Orientation="Horizontal" VerticalAlignment="Center">
                     <Button x:Name="NavToggle" Content="☰" Style="{StaticResource GhostButton}" Click="OnToggleNav" Padding="11,6" Margin="0,0,14,0"
                             ToolTip="隱藏功能欄 (Ctrl+M)"/>
@@ -96,9 +103,13 @@
                     <StackPanel x:Name="EditToolbar" Orientation="Horizontal" VerticalAlignment="Center">
                     <Button x:Name="OpenButton" Content="開啟 PDF" Style="{StaticResource GhostButton}" Click="OnOpen" Padding="14,8"/>
                     <Border Width="1" Background="#22304A" Margin="14,4"/>
-                    <Button x:Name="PrevPage" Content="‹" Style="{StaticResource GhostButton}" Click="OnPrevPage" Padding="12,6" IsEnabled="False" ToolTip="上一頁 (PageUp)"/>
-                    <TextBlock x:Name="PageLabel" Text="–" Margin="10,0" MinWidth="60" TextAlignment="Center" VerticalAlignment="Center" Foreground="#C6D4EA"/>
+                    <Button x:Name="FirstPage" Content="«" Style="{StaticResource GhostButton}" Click="OnFirstPage" Padding="10,6" IsEnabled="False" ToolTip="第一頁"/>
+                    <Button x:Name="PrevPage" Content="‹" Style="{StaticResource GhostButton}" Click="OnPrevPage" Padding="12,6" Margin="4,0,0,0" IsEnabled="False" ToolTip="上一頁 (PageUp)"/>
+                    <TextBox x:Name="PageBox" Style="{StaticResource FieldBox}" Width="56" Padding="6,5" Margin="8,0,0,0" TextAlignment="Center" VerticalAlignment="Center" IsEnabled="False"
+                             KeyDown="OnPageBoxKey" LostFocus="OnPageBoxLostFocus" GotFocus="OnPageBoxGotFocus" ToolTip="輸入頁碼後按 Enter 跳到該頁 (Ctrl+G)"/>
+                    <TextBlock x:Name="PageLabel" Text="/ –" Margin="6,0,8,0" MinWidth="34" VerticalAlignment="Center" Foreground="#C6D4EA"/>
                     <Button x:Name="NextPage" Content="›" Style="{StaticResource GhostButton}" Click="OnNextPage" Padding="12,6" IsEnabled="False" ToolTip="下一頁 (PageDown)"/>
+                    <Button x:Name="LastPage" Content="»" Style="{StaticResource GhostButton}" Click="OnLastPage" Padding="10,6" Margin="4,0,0,0" IsEnabled="False" ToolTip="最後一頁"/>
                     <ComboBox x:Name="ZoomBox" Width="96" Margin="14,0,0,0" SelectionChanged="OnZoomChanged" ToolTip="縮放">
                         <ComboBoxItem Content="75%" Tag="0.75"/>
                         <ComboBoxItem Content="100%" Tag="1.0"/>
@@ -106,15 +117,32 @@
                         <ComboBoxItem Content="150%" Tag="1.5"/>
                         <ComboBoxItem Content="200%" Tag="2.0"/>
                     </ComboBox>
-                    <Button x:Name="ReOcrButton" Content="重新辨識此頁" Style="{StaticResource GhostButton}" Click="OnReOcr" Padding="14,8" Margin="14,0,0,0" IsEnabled="False"
-                            ToolTip="以影像辨識（OCR）重新分析這一頁，即使它有文字層"/>
                     </StackPanel>
                 </StackPanel>
-                <StackPanel x:Name="EditRight" DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
-                    <TextBlock x:Name="ModifiedLabel" Text="" Foreground="#9FE9FF" VerticalAlignment="Center" Margin="0,0,14,0"/>
-                    <Button x:Name="ExportButton" Content="預覽並輸出" Style="{StaticResource PrimaryButton}" Click="OnPreviewExport" IsEnabled="False"/>
-                </StackPanel>
             </DockPanel>
+            <!-- row 2: the tools of the edit view, in two labelled groups. A WrapPanel: when the
+                 window is too narrow a group moves to the next line instead of being cut off. -->
+            <WrapPanel x:Name="EditTools" Orientation="Horizontal" Margin="0,10,0,0">
+                <StackPanel Orientation="Horizontal" Margin="0,2,26,2">
+                    <TextBlock Text="辨識" FontSize="12" Foreground="{StaticResource MutedInkBrush}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                    <Button x:Name="ReOcrButton" Content="重新辨識此頁" Style="{StaticResource GhostButton}" Click="OnReOcr" Padding="14,8" Margin="0" IsEnabled="False"
+                            ToolTip="以影像辨識（OCR）重新分析這一頁，即使它有文字層"/>
+                    <CheckBox x:Name="QualityBox" Content="最高精度辨識（較慢）" VerticalAlignment="Center" Margin="14,0,0,0" Click="OnQualityToggled"
+                              ToolTip="勾選後，每一行都用大模型辨識，一頁可能要多花數倍時間。&#x0a;不勾選（預設）：先用輕量模型全讀，沒把握的行才交給大模型複核。&#x0a;已經辨識過的頁面要按「重新辨識此頁」才會套用。"/>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" Margin="0,2,0,2">
+                    <TextBlock Text="塗改" FontSize="12" Foreground="{StaticResource MutedInkBrush}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                    <CheckBox x:Name="EraseToggle" Content="框選塗改區域" VerticalAlignment="Center" Click="OnEraseToggled"
+                              ToolTip="勾選後在頁面上拖曳，框出破損或髒汙的區域；輸出時該區域會填成底色，原本的影像內容會從檔案中移除。&#x0a;點一下方框可選取，按 Delete 移除。"/>
+                    <TextBlock Text="填滿" FontSize="12" Foreground="{StaticResource MutedInkBrush}" VerticalAlignment="Center" Margin="16,0,0,0"/>
+                    <ComboBox x:Name="EraseFillBox" Width="112" Margin="8,0,0,0" SelectionChanged="OnEraseFillChanged" ToolTip="塗改區域的填滿方式（套用到新畫的方框，以及目前選取的方框）">
+                        <ComboBoxItem Content="接近底色" Tag="auto" IsSelected="True"/>
+                        <ComboBoxItem Content="純白" Tag="white"/>
+                    </ComboBox>
+                    <Button x:Name="EraseClearButton" Content="清除此頁塗改" Style="{StaticResource GhostButton}" Click="OnEraseClearPage" Padding="12,8" Margin="10,0,0,0" IsEnabled="False"/>
+                </StackPanel>
+            </WrapPanel>
+            </StackPanel>
         </Border>
 
         <!-- ===== content ===== -->
@@ -152,7 +180,10 @@
                             </Border.Effect>
                         </Border>
                         <Image x:Name="PageImage" Stretch="Fill" RenderOptions.BitmapScalingMode="HighQuality"/>
+                        <Image x:Name="LiveImage" Stretch="Fill" Visibility="Collapsed" IsHitTestVisible="False" RenderOptions.BitmapScalingMode="HighQuality"/>
                         <Canvas x:Name="Overlay" Background="Transparent" MouseLeftButtonDown="OnOverlayEmptyClick"/>
+                        <Canvas x:Name="EraseLayer" Background="Transparent" IsHitTestVisible="False" ClipToBounds="True"
+                                MouseLeftButtonDown="OnEraseDown" MouseMove="OnEraseMove" MouseLeftButtonUp="OnEraseUp"/>
                         <Canvas x:Name="BeamLayer" IsHitTestVisible="False" ClipToBounds="True"/>
                     </Grid>
                 </ScrollViewer>
@@ -361,6 +392,8 @@
                       <TextBox x:Name="WordRangeBox" Style="{StaticResource FieldBox}" Margin="22,8,0,0" IsEnabled="False" ToolTip="例：1-3, 5, 8-"/>
                       <TextBlock x:Name="WordRangeHint" Foreground="{StaticResource MutedInkBrush}" FontSize="11.5" Margin="22,6,0,0" TextWrapping="Wrap"/>
                       <CheckBox x:Name="WordUseEdits" Content="套用「編輯 PDF」中已修改的文字" Margin="0,22,0,0"/>
+                      <CheckBox x:Name="WordQualityBox" Content="最高精度辨識（較慢）" Margin="0,12,0,0" Click="OnQualityToggled"
+                                ToolTip="勾選後，掃描頁的每一行都用大模型辨識，一頁可能要多花數倍時間。&#x0a;不勾選（預設）：先用輕量模型全讀，沒把握的行才交給大模型複核。"/>
                       <Button x:Name="WordButton" Content="轉成 Word  →" Style="{StaticResource PrimaryButton}" Click="OnWordConvert" Margin="0,26,0,0" IsEnabled="False"/>
                   </StackPanel>
               </Border>

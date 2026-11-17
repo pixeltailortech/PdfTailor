@@ -22,6 +22,10 @@ class TextStyle:
     """
 
     family: str | None = None
+    # Office keeps two fonts per run. When ``family`` is an East Asian font and the Latin
+    # letters and digits of the line are set in another face (標楷體 with Times New Roman),
+    # that face is named here; None means the letters come from ``family`` itself.
+    latin_family: str | None = None
     size: float = 10.5
     bold: bool = False
     italic: bool = False
@@ -33,6 +37,7 @@ class TextStyle:
     def to_json(self) -> dict[str, Any]:
         return {
             "family": self.family,
+            "latinFamily": self.latin_family,
             "size": round(self.size, 2),
             "bold": self.bold,
             "italic": self.italic,
@@ -48,6 +53,7 @@ class TextStyle:
         c = d.get("color") or [17, 17, 17]
         return TextStyle(
             family=d.get("family"),
+            latin_family=d.get("latinFamily"),
             size=float(d.get("size", 10.5)),
             bold=bool(d.get("bold", False)),
             italic=bool(d.get("italic", False)),
@@ -63,6 +69,7 @@ class TextStyle:
     def same_look(self, other: "TextStyle", size_tol: float = 0.35) -> bool:
         return (
             (self.family or "") == (other.family or "")
+            and (self.latin_family or "") == (other.latin_family or "")
             and self.bold == other.bold
             and self.italic == other.italic
             and self.color == other.color

@@ -23,3 +23,6 @@ _to_delete/
 *.rar
 /PdfTailor/
 vendor/tesseract/
+
+# PP-OCRv5 model files (about 170 MB): staged locally, shipped in the release archive
+vendor/ocr-models/

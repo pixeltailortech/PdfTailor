@@ -36,7 +36,7 @@ from .models import Edit
 SCHEMA = 1
 _CHUNK = 1 << 20  # 1 MiB
 
-KIND_LABELS = {"text": "修改文字", "delete": "刪除", "style": "修改樣式", "move": "移動"}
+KIND_LABELS = {"text": "修改文字", "delete": "刪除", "style": "修改樣式", "move": "移動", "erase": "塗改"}
 EDIT_CSV_COLUMNS = ["序號", "頁碼", "動作類型", "原文", "新文", "原字數", "新字數", "原位置", "新位置", "字型", "字級", "粗體", "斜體", "顏色"]
 ARRANGE_CSV_COLUMNS = ["序號", "輸出頁碼", "原始頁碼", "旋轉角度", "動作類型"]
 
@@ -144,8 +144,10 @@ def build_edit_audit(
     verify: dict | None,
     include_text: bool = True,
     src_sha_before: str | None = None,
+    erases: list | None = None,
 ) -> dict[str, Any]:
-    """The audit record for an ``export``. ``src`` is the open source ``PdfDoc``."""
+    """The audit record for an ``export``. ``src`` is the open source ``PdfDoc``.
+    ``erases``: the painted-over boxes (:class:`erase.Erase`), recorded as kind "erase"."""
     audit = _header("edit-text", src.path, src.page_count, out_path, src_sha_before)
     audit["includeText"] = bool(include_text)
     changes = []
@@ -155,6 +157,22 @@ def build_edit_audit(
         kinds = edit_kinds(e)
         if kinds:
             changes.append(_edit_change(e, kinds, include_text))
+    for er in erases or []:
+        changes.append(
+            {
+                "page": er.page,
+                "blockId": None,
+                "kinds": ["erase"],
+                "newText": "（已自檔案移除原內容）" if er.removed else "（僅覆蓋，原內容仍在檔案中）",
+                "originalLength": 0,
+                "newLength": 0,
+                "originalBounds": _rect(er.rect),
+                "newBounds": _rect(er.rect),
+                "eraseMode": er.mode,
+                "eraseRemoved": bool(er.removed),  # False: only covered, the content is still in the file
+                "style": {"family": None, "size": 0, "bold": False, "italic": False, "color": list(er.fill or er.color)},
+            }
+        )
     audit["changes"] = changes
     audit["verify"] = verify
     return audit

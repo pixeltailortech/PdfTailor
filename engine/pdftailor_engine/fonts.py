@@ -328,6 +328,11 @@ class FontIndex:
             # A CJK family asked for by name (標楷體, 微軟正黑體) keeps its own Latin glyphs:
             # Office PDFs name the Latin font separately when it differs.
             cjk_family = latin_family = requested
+            if style.latin_family:
+                if self.has_family(style.latin_family):
+                    latin_family = style.latin_family
+                else:
+                    notes.append(f"font-missing:{style.latin_family}")
         else:
             latin_family = requested or latin_default or cjk_default
             cjk_family = cjk_default or latin_family
@@ -486,7 +491,13 @@ class Embedder:
             font.close()
         rl_name = f"PT_{digest}"
         if rl_name not in pdfmetrics.getRegisteredFontNames():
-            pdfmetrics.registerFont(RLTTFont(rl_name, out))
+            rl_font = RLTTFont(rl_name, out)
+            # reportlab keeps one font object per *face name* and hands it out again for
+            # any later registration of that face — here an earlier, different subset of the
+            # same font, so every character missing from that subset came out as an empty
+            # box in the second export of a session. Forget the stale entry first.
+            getattr(pdfmetrics, "_dynFaceNames", {}).pop(rl_font.face.name, None)
+            pdfmetrics.registerFont(rl_font)
         self._names[face.id] = rl_name
         self._paths[rl_name] = out
         return rl_name

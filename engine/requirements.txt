@@ -3,7 +3,6 @@ pikepdf>=9.0
 reportlab>=4.0
 fonttools>=4.50
 numpy
-scipy
 opencv-python-headless
 Pillow
 pytest

@@ -95,6 +95,7 @@ public partial class MainWindow
         PagesView.Visibility = mode == Mode.Pages ? Visibility.Visible : Visibility.Collapsed;
         EditToolbar.Visibility = edit ? Visibility.Visible : Visibility.Collapsed;
         EditRight.Visibility = edit ? Visibility.Visible : Visibility.Collapsed;
+        EditTools.Visibility = edit ? Visibility.Visible : Visibility.Collapsed;
         NavEdit.Tag = edit ? "active" : null;
         NavMerge.Tag = mode == Mode.Merge ? "active" : null;
         NavWord.Tag = mode == Mode.Word ? "active" : null;
