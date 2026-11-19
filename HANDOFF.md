@@ -670,3 +670,47 @@ tessdata_best 在此樣本反而較差（CER 13.8%、慢 2.4 倍），維持 fas
   （PyInstaller `--version-file`，已列入 buildhash，改它會觸發重建）。
 - 待核對：Tesseract DLL 授權是依上游專案整理（未附原檔），含 LGPL 與 JBIG-KIT（GPL-2.0+）；只在公司內部使用影響小，
   對外散布前要核對，或考慮拿掉 Tesseract（現在主要用 PP-OCR）。PP-OCRv6 medium 模型授權請再對照官方模型頁。
+
+## 追加（2026-11-19）：PDF 轉 Word——Word 轉 PDF／Word 直接列印的文件（以 `D:\AI\Test\九份一日遊.pdf` 實測）
+
+測試檔由 `九份一日遊_論文格式範本-v2.docx` 經「Microsoft Print To PDF」產生；舊版輸出 `九份一日遊_OUT.docx` 字級全部大 1.33 倍、字型名稱是 `CIDFont+F 2`、跑版到 12 頁。
+
+**原因與修正**
+1. **字級**（`textlayer._render_scale`）：Print To PDF 以 `0.75 0 0 -0.75 … cm`（96 dpi 像素→pt）畫頁面，12 pt 寫成 `16 Tf`；`FPDFText_GetFontSize` 只回傳 Tf。改為 `Tf × hypot(c, d)`（`FPDFText_GetMatrix`，含 Tm×CTM）。也修好「`1 Tf` 加放大 Tm」的檔案，以及編輯 PDF 時新字的字級。
+2. **字型名稱**（`textlayer._embedded_font_name`）：名稱沒有意義（`CIDFont+F1`、`F3`、`TT1`）時，從內嵌字型檔的 `name` 表讀真名（fontTools；PostScript 名優先，解析不到已知字族時改用字族名，例：`MS-Gothic`→`MS Gothic`）。
+3. **字重**：pdfium 在描述檔沒有 /FontWeight 時回傳亂數（實測 4140），舊版因此把整份判成粗體；現在只接受 100–1000。描邊加粗（`2 Tr`，Word 對沒有粗體字面的字型這樣印）判為粗體。
+4. **字序**：一行內改依筆起點（`FPDFText_GetCharOrigin`，`Glyph.ox`）排序，不用筆畫框——全形「（」「「」的筆畫偏右，舊版讀成「觀（光」「時「間」。
+5. **空格**：中文字間的空格改依筆起點判斷（全形字前進 1 em，多出 ≥ 0.2 em 就是空格，`_CJK_ADV_SPACE_EM`）；文字層真的有的空格不再被 `_squeeze_cjk_spaces` 刪掉（只刪掃描推測出的）。「第一章 緒論」「1.1 研究背景」恢復空格。
+6. **頁首／頁尾／頁碼**（`docstruct.split_running`、`docxout._write_hf`）：頁面上下 12% 帶內的最上／最下兩列，若是頁碼（`3`、`ii`、`- 3 -`、`第 3 頁`、`3 / 9`）或同樣文字（數字不計）出現在 ≥2 頁（多於 6 頁時 ≥30% 頁）且字級不大於內文 1.05 倍，就移出內文、寫成 Word 頁首／頁尾。頁碼寫成 PAGE 功能變數，每個區段設 `pgNumType`（格式＋起始值＝PDF 上的頁碼），所以羅馬數字 i、ii 與正文 1 起算都對。相同的頁首頁尾沿用「連結到前一節」。頁首距離、頁尾距離取實際位置。
+7. **目錄**：「標題 ……… 12」的前導點改成 TAB＋右對齊點線定位點（`Line.leader`、tab 種類 `right-dot`）；目錄行不再兩行黏成一段，也不再被當成清單或標題。
+8. **清單**：編號縮排、換行回到左邊的清單（Word 的編號清單常見）用首行縮排＋定位點（`Para.wrap_left`），不再整段內縮；單行段落夾在同樣行距的多行段落間時沿用該行距，不再多加段前距（`_spacing`）。
+
+**結果**（`tools/docx_compare.py 原稿.docx 轉出.docx --render`）
+- 字級：舊 16 pt 72% → 新 12 pt 65%（原稿 12 pt 63%）；字型：DFKai-SB／Times New Roman／MS Gothic（原稿同）。
+- 文字相似度 0.819 → 0.979；頁首頁尾 0 → 正確；LibreOffice 以 PDF 內嵌的原字型排版，頁數 12 → 9（與 PDF 相同；PDF 第 2 頁本來就是空白頁）。
+
+**測試**：`tests/docfix.printed_pdf`（模擬 Print To PDF：0.75 CTM、字型改名 CIDFont+Fn、頁首、置中頁碼、前導點目錄）；`test_docx.py` 新增 3 項。引擎 pytest 165 項全過。
+- 注意：在容器裝了 PDF 內嵌的 MS Gothic 子集後，`test_fonts.py::test_office_script_split` 會因環境失敗（舊版同樣失敗），與程式無關。
+
+**尚未處理（下一步）**
+- 表格：封面無框線資訊表（4×2，字距拉開的「研 究 主 題：」）變成一般段落；跨頁的三線表拆成兩個表，第二段欄位錯位；表頭兩格黏成一格。
+- 圖片框（1×1 表格）變成段落；頁首下的橫線沒有畫出。
+- 區段仍是一頁一節（保留 PDF 的分頁）。
+- 掃描後的 Word 文件（OCR 路徑）沒有改動字型判斷；這次的修正大多針對有文字層的 PDF。
+
+- 2026-11-19 補充：Word 內建標題樣式預設「段落中不分頁」(keepLines)，在 Word 顯示格式標記時每個標題左邊會有小黑方塊；`docxout._style_headings` 已一併關掉（`keep_together = False`），`test_headings_carry_no_keep_flags` 檢查。
+
+- 2026-11-19 再補充：
+  1. **「標籤：內容」不當標題**（`docstruct._is_label_line`、`_classify`）：標籤去掉空白 ≤ 8 字、冒號後有內容、標籤不是純數字（排除 `09:30`）的行，以及緊接其後同字級的折行（「…空間動線與時／間配置」），不列為標題候選。副作用：「附件一：○○○」這類真標題若字級比內文大也會被排除；「摘要：」（冒號後沒內容）不受影響。測試：`test_label_lines_are_not_headings`、`test_label_detection`（`docfix.cover_pdf`）。
+  2. **行群組容差**（`textlayer._cluster_lines`）：原本只看整頁中位字級；「、」「，」的筆畫在字格底部，16 pt 標題夾在 10.5 pt 內文的頁面上，「一、目的」會被切成「一 目的」＋「、」。容差改為 `0.5 × max(整頁中位字級, 該字字級, 該行最大字級)`（只增不減）。
+  3. `tools/docx_compare.py` 修正：合併儲存格去重原本用 `id()`，物件回收後 id 會重複，同一檔案的文字吻合度會跳動（0.965～0.979）；改為保留物件參照。修正後九份範例：舊版 0.851 → 新版 0.998（剩下的差異只有清單符號：原稿是 Word 自動編號，轉出為真正的文字）。先前記載的 0.819／0.979 偏低，以此為準。
+
+## 2026-11-19 表格處理（封面無框線表、跨頁表、表頭黏連）
+- `Block.char_x`（textlayer 逐字 x 座標）→ `docstruct.split_block` 可在任意 x 切開文字區塊。有框線表格：區塊依格線（尊重合併儲存格 `vsep`）切開後再分格，修正「時段區間 空間節點」黏成一格。
+- 封面「標籤：內容」：`_split_label_values`（≥2 行對齊，或與獨立的「標籤：」區塊對齊）切在冒號後 → `detect_text_tables` 組成無框線表；換行的值（`_wraps_from`、`_build_text_table` cont 規則）併入同一格。
+- `_finish`：單行儲存格段落不做清單標記（「11.75 小時」、「1. 版面…」）；`_starts_new(in_cell)`：寬鬆列距但已排滿的儲存格行視為換行。
+- 跨頁表格：`_merge_continued_tables`（欄數相同、欄寬差 ≤3pt、頁尾接頁首）併入前一頁的 PageDoc（不再分節）；續頁若重複表頭則丟掉重複列並設 `Table.header_rows`（docxout 寫 `w:tblHeader`）。
+- 測試：`test_label_lines_are_not_headings`（封面表）、`test_table_split_across_pages_is_one_table`、`test_repeated_header_becomes_repeat_row`、`test_different_tables_are_not_merged`；fixture `docfix.split_table_pdf`、`cover_pdf` 改為兩欄對齊。pytest 171 全過（需把 ~/.fonts 移走才跑 test_fonts）。
+- 九份範例：4 表（封面 4×2、規格 5×2、行程 9×5 已合併）、8 節、文字相似度 0.998。尚未處理：1×1 虛線圖框（現為段落）、頁首下方橫線、每頁一節。
+- 2026-11-19 補：封面標籤欄在 Word 折行（「研 究 主 / 題：」）。原因：標籤的空白字元在 Word 字型下比 PDF 寬。改成 `_tighten_label`：字距空白移除，改用 `TextStyle.spacing`（`w:spacing` 字元間距，冒號另成一個 run 不帶間距），同組標籤共用同一間距、左緣對齊，間距由「值起點 − 標籤起點 − 12pt」推算，保證放得進標籤欄；欄界改在值起點前（不再取中點）；同列的單行儲存格沿用換行值的行距，首行才會對齊。輸出 `九份一日遊_OUT_v9.docx`。
+- 2026-11-19 符號：PDF 的項目符號是 Symbol 字型的 0xB7，textlayer 已解碼成 Unicode「•」，但 run 的字型仍寫成 Symbol，Word 以 Symbol 字型顯示 U+2022 會變成空白方框。`docxout._add_run`：文字已非私有區字元時，不再用 Symbol/Wingdings 當字型（改用 Calibri，缺字由 Word 自動換字型）；仍是私有區字元者保留 Symbol/Wingdings。另外項目符號與內文之間多出的空白（「•\t 交通…」）已去除（`_finish`）。輸出 `九份一日遊_OUT_v10.docx`。

@@ -245,3 +245,115 @@ def band_pdf(path: str, dark: bool) -> str:
     c.showPage()
     c.save()
     return path
+
+
+def printed_pdf(path: str, pages: int = 3) -> str:
+    """What Microsoft Print to PDF makes of a Word file: device units and anonymous fonts.
+
+    The page is drawn through ``0.75 0 0 0.75`` (96 dpi pixels to points), so 12 pt body
+    text is written as ``16 Tf``; every font is renamed ``CIDFont+F<n>``. Each page has a
+    running header and a centred page number; page 1 has a contents line with a dot leader.
+    """
+    import pikepdf
+
+    tmp = path + ".raw.pdf"
+    c = canvas.Canvas(tmp, pagesize=(W, H))
+    k = 1 / 0.75
+    for pg in range(pages):
+        c.saveState()
+        c.transform(0.75, 0, 0, 0.75, 0, 0)
+        c.setFont("CJK", 9 * k)
+        c.drawRightString(R * k, (H - 40) * k, "九份山城文化景觀研究")
+        c.setFont("CJK", 16 * k)
+        c.drawString(L * k, (H - 90) * k, f"第{'一二三'[pg % 3]}章 緒論")
+        y = H - 130
+        c.setFont("CJK", 12 * k)
+        if pg == 0:
+            c.drawString(L * k, y * k, "目錄")
+            y -= 24
+            c.drawString(L * k, y * k, "第一章 緒論 " + "." * 60)
+            c.drawRightString(R * k, y * k, "1")
+            y -= 30
+        for line in ["九份聚落（觀光與休閒）長期為北台灣重要觀光節點，本研究探討其動線與",
+                     "時段配置之關係，並提出「時間先後順序」之規劃原則。"]:
+            c.drawString(L * k, y * k, line)
+            y -= 22
+        c.setFont("CJK", 10.5 * k)
+        c.drawCentredString(W / 2 * k, 40 * k, str(pg + 1))
+        c.restoreState()
+        c.showPage()
+    c.save()
+    with pikepdf.open(tmp) as pdf:
+        n = 0
+        names = {}
+        for page in pdf.pages:
+            for _, f in page.Resources.get("/Font", {}).items():
+                key = str(f.get("/BaseFont"))
+                if key not in names:
+                    n += 1
+                    names[key] = pikepdf.Name(f"/CIDFont+F{n}")
+                f.BaseFont = names[key]
+                for d in f.get("/DescendantFonts", []):
+                    d.BaseFont = names[key]
+                    if "/FontDescriptor" in d:
+                        d.FontDescriptor.FontName = names[key]
+                if "/FontDescriptor" in f:
+                    f.FontDescriptor.FontName = names[key]
+        pdf.save(path)
+    os.remove(tmp)
+    return path
+
+
+def cover_pdf(path: str) -> str:
+    """A cover page: field lines ("研究主題：…") set larger than the body, then real headings."""
+    c = canvas.Canvas(path, pagesize=(W, H))
+    y = H - 90
+    c.setFont("CJK", 20)
+    c.drawCentredString(W / 2, y, "品質管理程序書")
+    y -= 60
+    c.setFont("CJK", 14)
+    # label column + value column (the value of the first field wraps onto a second line)
+    rows = [("研 究 主 題：", "台灣北部山城聚落一日遊空間動線與時間配置的研"), ("", "究方法"),
+            ("作者姓名：", "王大明"), ("完成日期：", "2026 年 11 月")]
+    for lab, val in rows:
+        c.drawString(L + 40, y, lab)
+        c.drawString(L + 40 + 100, y, val)
+        y -= 28
+    y -= 20
+    c.setFont("CJK", 16)
+    c.drawString(L, y, "一、目的")
+    y -= 26
+    y = paragraph(c, y, "本程序規範公司內所有產品之進料檢驗、製程檢驗與出貨檢驗之作業方式，確保產品符合客戶要求及相關法規之規定。",
+                  font="CJK", size=10.5, lead=16, indent=21)
+    y = paragraph(c, y, "各部門應依本程序執行並保存相關紀錄，保存期限不得少於三年，逾期銷毀前須經管理代表核准。", font="CJK", size=10.5, lead=16, indent=21)
+    c.showPage()
+    c.save()
+    return path
+
+
+def split_table_pdf(path: str, repeat_header: bool = False) -> str:
+    """A ruled table the printer broke at a page boundary (page 2 sits 14 pt further right, as
+    with mirrored margins). Header cells are nearly as wide as their text, so the cell gaps
+    are narrower than a word space."""
+    c = canvas.Canvas(path, pagesize=(W, H))
+    head = ["時段區間", "空間節點", "停留時間"]
+    rows = [["08:30", "台北車站出發", "70 分鐘"], ["09:40", "黃金博物館", "130 分鐘"], ["11:50", "基山街午餐", "100 分鐘"],
+            ["13:30", "輕便路漫步", "120 分鐘"], ["15:30", "豎崎路取景", "120 分鐘"]]
+    for pg in range(2):
+        x0 = L + 14 * pg
+        xs = [x0, x0 + 56, x0 + 56 + 90, x0 + 56 + 90 + 60]
+        data = ([head] if pg == 0 or repeat_header else []) + (rows[:3] if pg == 0 else rows[3:])
+        n = len(data)
+        top = 150.0 if pg == 0 else H - 70.0
+        top = H - 640.0 + 22 * n if pg == 0 else top  # page 1: table ends near the foot of the page
+        ys = [top - 22 * i for i in range(n + 1)]
+        if pg == 0:
+            ys = [H - 800.0 + 22 * (n - i) for i in range(n + 1)]
+        grid(c, xs, ys)
+        for r, row in enumerate(data):
+            c.setFont("CJK", 10.5)
+            for j, t in enumerate(row):
+                c.drawString(xs[j] + 3, ys[r] - 15, t)
+        c.showPage()
+    c.save()
+    return path

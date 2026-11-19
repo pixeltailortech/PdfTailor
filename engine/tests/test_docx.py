@@ -272,3 +272,134 @@ def test_shaded_header_band_belongs_to_table(tmp_path, dark):
     assert [c.text for c in t.rows[0].cells] == ["Item", "Check", "Limit"]
     assert len(t.rows) == 4
     assert t.cell(0, 0)._tc.tcPr.find(qn("w:shd")) is not None  # the band's colour survives
+
+
+# --------------------------------------------------------------------------- Word printed to PDF
+
+def test_printed_pdf_sizes_fonts_and_order(tmp_path):
+    """Microsoft Print to PDF: 16 Tf under a 0.75 CTM is 12 pt; fonts named CIDFont+Fn."""
+    pdf = docfix.printed_pdf(str(tmp_path / "printed.pdf"))
+    doc, _, _ = export(tmp_path, pdf)
+    texts = [p.text for p in paras(doc)]
+    body_p = next(p for p in paras(doc) if p.text.startswith("九份聚落"))
+    assert {r.font.size.pt for r in body_p.runs if r.text.strip()} == {12.0}
+    head = next(p for p in paras(doc) if p.text.startswith("第一章") and "\t" not in p.text)
+    assert {r.font.size.pt for r in head.runs if r.text.strip()} == {16.0}
+    assert head.text == "第一章 緒論"  # the typed space survives
+    fams = {r._r.rPr.rFonts.get(qn("w:eastAsia")) for p in paras(doc) for r in p.runs if r.text.strip()}
+    assert not any(f and f.startswith("CIDFont") for f in fams)
+    assert "（觀光與休閒）" in body_p.text  # full-width bracket keeps its place
+
+
+def test_printed_pdf_header_footer_and_contents(tmp_path):
+    pdf = docfix.printed_pdf(str(tmp_path / "printed.pdf"))
+    doc, res, _ = export(tmp_path, pdf)
+    texts = [p.text.strip() for p in paras(doc)]
+    assert "九份山城文化景觀研究" not in texts
+    assert not any(t in ("1", "2", "3") for t in texts)
+    assert res["headers"] >= 1 and res["footers"] >= 1
+    sec = doc.sections[0]
+    assert sec.header.paragraphs[0].text == "九份山城文化景觀研究"
+    foot = sec.footer.paragraphs[0]._p.xml
+    assert "PAGE" in foot and "fldChar" in foot
+    assert all(s._sectPr.find(qn("w:pgNumType")) is not None for s in doc.sections)
+    # later pages reuse the header: linked to the previous section
+    assert doc.sections[1].header.is_linked_to_previous
+    toc = next(p for p in paras(doc) if p.text.endswith("\t1"))
+    assert toc.text == "第一章 緒論\t1"
+    stops = list(toc.paragraph_format.tab_stops)
+    assert len(stops) == 1 and stops[0].leader is not None and int(stops[0].leader) == 1  # dots
+
+
+def test_page_number_patterns():
+    from pdftailor_engine.docstruct import page_number_of
+
+    assert page_number_of("12")[1:] == ("decimal", "", 12)
+    assert page_number_of("ii")[1:] == ("lowerRoman", "", 2)
+    assert page_number_of("- 3 -") == ("- ", "decimal", " -", 3)
+    assert page_number_of("第 4 頁")[1] == "decimal"
+    assert page_number_of("mix") is None and page_number_of("Total") is None
+
+
+def test_headings_carry_no_keep_flags(tmp_path):
+    pdf = docfix.printed_pdf(str(tmp_path / "printed.pdf"))
+    doc, _, _ = export(tmp_path, pdf)
+    for lvl in range(1, 5):
+        pf = doc.styles[f"Heading {lvl}"].paragraph_format
+        assert not pf.keep_with_next and not pf.keep_together
+
+
+def test_label_lines_are_not_headings(tmp_path):
+    """"標籤：內容" lines on a cover stay body text (a borderless table), never headings."""
+    pdf = docfix.cover_pdf(str(tmp_path / "cover.pdf"))
+    doc, _, _ = export(tmp_path, pdf)
+    heads = [p.text for p in paras(doc) if p.style.name.startswith("Heading")]
+    assert heads == ["品質管理程序書", "一、目的"]
+    assert len(doc.tables) == 1
+    rows = [[c.text for c in r.cells] for r in doc.tables[0].rows]
+    # the wrapped value stays inside its own cell; no empty continuation row
+    assert rows == [["研究主題：", "台灣北部山城聚落一日遊空間動線與時間配置的研究方法"],
+                    ["作者姓名：", "王大明"], ["完成日期：", "2026 年 11 月"]]
+    # the letter-spaced label keeps its look as character spacing, not as typed spaces (a
+    # space is wider in Word's fonts and wrapped the label inside its column)
+    from docx.oxml.ns import qn
+    r0 = doc.tables[0].rows[0].cells[0].paragraphs[0].runs[0]._r
+    assert int(r0.rPr.find(qn("w:spacing")).get(qn("w:val"))) > 0
+    col = doc.tables[0].columns[0].width.pt
+    assert col >= 5 * 10.5 + 8
+
+
+def test_label_detection():
+    from pdftailor_engine.docstruct import _is_label_line
+
+    assert _is_label_line("研 究 主 題： 台灣北部山城聚落")
+    assert _is_label_line("關鍵詞：九份聚落、一日遊動線")
+    assert _is_label_line("Author: Wang")
+    assert not _is_label_line("第一章 緒論")
+    assert not _is_label_line("09:30 出發")
+    assert not _is_label_line("摘要：")  # nothing after the colon: a heading with a colon
+    assert not _is_label_line("這是一段很長很長的說明文字：後面還有內容")
+
+
+def _cells(doc, i=0):
+    return [[c.text for c in r.cells] for r in doc.tables[i].rows]
+
+
+def test_table_split_across_pages_is_one_table(tmp_path):
+    doc, _, _ = export(tmp_path, docfix.split_table_pdf(str(tmp_path / "s.pdf")))
+    assert len(doc.tables) == 1
+    rows = _cells(doc)
+    assert rows[0] == ["時段區間", "空間節點", "停留時間"]  # header cells stay apart
+    assert [r[0] for r in rows[1:]] == ["08:30", "09:40", "11:50", "13:30", "15:30"]
+    assert len(doc.sections) == 1
+
+
+def test_repeated_header_becomes_repeat_row(tmp_path):
+    doc, _, _ = export(tmp_path, docfix.split_table_pdf(str(tmp_path / "s.pdf"), repeat_header=True))
+    assert len(doc.tables) == 1
+    rows = _cells(doc)
+    assert [r[0] for r in rows] == ["時段區間", "08:30", "09:40", "11:50", "13:30", "15:30"]
+    from docx.oxml.ns import qn
+    assert doc.tables[0].rows[0]._tr.trPr.find(qn("w:tblHeader")) is not None
+
+
+def test_different_tables_are_not_merged(tmp_path):
+    doc, _, _ = export(tmp_path, docfix.ruled_pdf(str(tmp_path / "r.pdf"), pages=2))
+    assert len(doc.tables) == 2
+
+
+def test_decoded_bullet_is_not_set_in_a_symbol_font():
+    """A bullet read out of Symbol is plain Unicode now; named in Symbol, Word shows a box."""
+    from docx import Document as D
+    from docx.oxml.ns import qn
+    from pdftailor_engine.docxout import _add_run
+    from pdftailor_engine.docstruct import Run
+    from pdftailor_engine.models import TextStyle
+
+    d = D()
+    par = d.add_paragraph()
+    _add_run(par, Run("•\t", TextStyle(family="Symbol", size=12)))
+    _add_run(par, Run("", TextStyle(family="Symbol", size=12)))  # still private-use: needs Symbol
+    fonts = [r._r.rPr.find(qn("w:rFonts")).get(qn("w:ascii")) for r in par.runs]
+    assert fonts[0] != "Symbol"
+    assert fonts[1] == "Symbol"

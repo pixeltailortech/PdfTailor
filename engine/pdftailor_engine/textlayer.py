@@ -7,7 +7,9 @@ font each glyph was set in, its weight and italic angle, its size and its fill c
 from __future__ import annotations
 
 import ctypes
+import io
 import math
+import re
 import unicodedata
 from dataclasses import dataclass
 
@@ -28,6 +30,7 @@ _BLOCK_SPLIT_EM = 2.2
 _SPACE_EM = 0.2
 _CJK_SPACE_EM = 0.75
 _ADV_SPACE_EM = 0.15
+_CJK_ADV_SPACE_EM = 0.2
 
 
 @dataclass
@@ -48,6 +51,9 @@ class Glyph:
     # horizontal extent of the glyph's advance (loose box), display space; the tight box of
     # a narrow glyph such as "1" leaves a gap that is not a space ("1 1 7" for 117)
     adv: tuple[float, float] | None = None
+    # where the pen stood when the glyph was drawn (display x). Reading order follows this:
+    # ink boxes of CJK glyphs and full-width punctuation overlap their neighbours.
+    ox: float | None = None
 
 
 @dataclass
@@ -85,6 +91,61 @@ def _read_name(fn, handle) -> str:
     if n <= 0:
         return ""
     return buf.value.decode("utf-8", "replace")
+
+
+# Names that say nothing about the face: "CIDFont+F1" (Microsoft Print to PDF), "F3",
+# "TT1", "Font5". The real name is then read from the embedded font program.
+_ANONYMOUS_FONT = re.compile(r"^(?:[A-Z]{6}\+)?(?:CIDFont\+)?(?:F|TT|T|C|Font)?\d+$|^CIDFont\+F\d+$", re.I)
+
+
+def _embedded_font_name(font) -> str:
+    """PostScript (or family) name from the embedded TrueType/OpenType ``name`` table."""
+    try:
+        size = ctypes.c_size_t(0)
+        if not raw.FPDFFont_GetFontData(font, None, 0, ctypes.byref(size)) or size.value < 12:
+            return ""
+        buf = (ctypes.c_uint8 * size.value)()
+        if not raw.FPDFFont_GetFontData(font, buf, size.value, ctypes.byref(size)):
+            return ""
+        from fontTools.ttLib import TTFont
+
+        tt = TTFont(io.BytesIO(bytes(buf)), lazy=True, fontNumber=0)
+        if "name" not in tt:
+            return ""
+        names = tt["name"]
+        found = []
+        for nid in (6, 4, 16, 1):  # PostScript name parses best ("MicrosoftJhengHeiBold")
+            v = (names.getDebugName(nid) or "").strip()
+            if v and not _ANONYMOUS_FONT.match(v):
+                if parse_pdf_font_name(v).family:
+                    return v
+                found.append((nid, v))
+        # no known family: the plain family name ("MS Gothic") beats a PostScript name
+        # that splits badly ("MS-Gothic" -> "MS")
+        for want in (16, 1, 4, 6):
+            for nid, v in found:
+                if nid == want:
+                    return v
+    except Exception:
+        return ""
+    return ""
+
+
+def _render_scale(tp, idx: int) -> float:
+    """How much the text and page matrices (Tm x CTM) scale the font size vertically.
+
+    ``FPDFText_GetFontSize`` is the bare ``Tf`` operand. Producers that draw in device
+    units — Microsoft Print to PDF sets ``0.75 0 0 -0.75 …`` and writes 16 for 12 pt type —
+    or that use ``1 Tf`` with a scaled ``Tm`` would otherwise read 1.33x or 12x too big.
+    """
+    m = raw.FS_MATRIX()
+    try:
+        if not raw.FPDFText_GetMatrix(tp.raw, idx, ctypes.byref(m)):
+            return 1.0
+    except Exception:
+        return 1.0
+    s = math.hypot(m.c, m.d)
+    return s if 1e-3 < s < 1e3 else 1.0
 
 
 def read_glyphs(doc: PdfDoc, page_number: int) -> tuple[list[Glyph], TextLayerStats]:
@@ -132,7 +193,15 @@ def read_glyphs(doc: PdfDoc, page_number: int) -> tuple[list[Glyph], TextLayerSt
             except Exception:
                 adv = None
 
-            size = float(raw.FPDFText_GetFontSize(tp.raw, idx))
+            size = float(raw.FPDFText_GetFontSize(tp.raw, idx)) * _render_scale(tp, idx)
+            ox = None
+            try:
+                px, py = ctypes.c_double(0), ctypes.c_double(0)
+                if raw.FPDFText_GetCharOrigin(tp.raw, idx, ctypes.byref(px), ctypes.byref(py)):
+                    o = geom.user_rect_to_display(UserRect(px.value, py.value, px.value, py.value))
+                    ox = o.x
+            except Exception:
+                ox = None
             angle = float(raw.FPDFText_GetCharAngle(tp.raw, idx))
             diff = abs((angle - want_angle + math.pi) % (2 * math.pi) - math.pi)
             upright = diff < math.radians(12)
@@ -151,11 +220,21 @@ def read_glyphs(doc: PdfDoc, page_number: int) -> tuple[list[Glyph], TextLayerSt
                     has_angle = raw.FPDFFont_GetItalicAngle(font, ctypes.byref(angle_i))
                     base = _read_name(raw.FPDFFont_GetBaseFontName, font)
                     fam = _read_name(raw.FPDFFont_GetFamilyName, font)
+                    if parse_pdf_font_name(base or fam).family is None:
+                        real = _embedded_font_name(font)
+                        if real and (parse_pdf_font_name(real).family or _ANONYMOUS_FONT.match(base or fam or "F1")):
+                            base = real
                     w = int(raw.FPDFFont_GetWeight(font))
                     ital = bool(flags & _FLAG_ITALIC) or (bool(has_angle) and angle_i.value != 0)
+                    # pdfium reports a made-up weight (4140 seen from Microsoft Print to PDF)
+                    # when the descriptor has none; only a real 100-1000 value means anything
+                    if not 100 <= w <= 1000:
+                        w = 400
                     bold = bool(flags & _FLAG_FORCE_BOLD) or w >= 600
                     font_cache[key] = (base, fam, w, bold, ital)
                 font_name, family_name, weight, bold_flag, italic_flag = font_cache[key]
+                if mode == 2:  # fill + stroke: how Word prints bold for a face without a bold style
+                    bold_flag = True
 
             r, g, b, a = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
             if raw.FPDFText_GetFillColor(tp.raw, idx, r, g, b, a):
@@ -197,6 +276,7 @@ def read_glyphs(doc: PdfDoc, page_number: int) -> tuple[list[Glyph], TextLayerSt
                     generated=False,
                     unresolved_symbol=unresolved,
                     adv=adv,
+                    ox=ox,
                 )
             )
     finally:
@@ -225,23 +305,31 @@ def _cluster_lines(glyphs: list[Glyph]) -> list[list[Glyph]]:
         return []
     sizes = sorted(g.size for g in glyphs if g.size > 0)
     typical = sizes[len(sizes) // 2] if sizes else 10.0
-    tol = max(1.5, typical * 0.5)
     ordered = sorted(glyphs, key=lambda g: g.box.cy)
     lines: list[list[Glyph]] = []
     line_cy = 0.0
+    line_size = 0.0
     for g in ordered:
+        # The tolerance follows the type size of the line itself: punctuation such as "、"
+        # or "，" has its ink at the bottom of the em box, up to ~0.4 em from the line's
+        # centre, and a 16 pt heading on a page of 10.5 pt text must not be judged by 10.5.
+        tol = max(1.5, 0.5 * max(typical, g.size, line_size))
         if lines and abs(g.box.cy - line_cy) <= tol:
             lines[-1].append(g)
             line_cy = sum(x.box.cy for x in lines[-1]) / len(lines[-1])
+            line_size = max(line_size, g.size)
         else:
             lines.append([g])
             line_cy = g.box.cy
+            line_size = g.size
     return lines
 
 
 def _split_segments(line: list[Glyph]) -> list[list[Glyph]]:
     """Splits a line at wide gaps so table cells and columns stay separate blocks."""
-    line = sorted(line, key=lambda g: g.box.x)
+    # Order by where each glyph starts (its advance), not by its ink: a full-width "（"
+    # or "「" has its ink at the right of its em box, so "（觀" sorted by ink reads "觀（".
+    line = sorted(line, key=lambda g: g.ox if g.ox is not None else g.box.x)
     segments: list[list[Glyph]] = [[line[0]]]
     for prev, cur in zip(line, line[1:]):
         size = max(prev.size, cur.size, 1.0)
@@ -262,6 +350,10 @@ def _needs_space(prev: Glyph, cur: Glyph) -> bool:
     size = max(prev.size, cur.size, 1.0)
     gap = cur.box.x - prev.box.right
     if is_cjk(prev.ch) and is_cjk(cur.ch):
+        if prev.ox is not None and cur.ox is not None and unicodedata.east_asian_width(prev.ch) in "WF":
+            # pen positions: a full-width glyph advances one em, anything more is a space
+            # the producer drew as a move rather than a glyph ("第一章 緒論" from Word)
+            return cur.ox - prev.ox - prev.size >= _CJK_ADV_SPACE_EM * size
         return gap >= _CJK_SPACE_EM * size
     if prev.adv is not None and cur.adv is not None and prev.adv[1] > prev.adv[0]:
         # between advances, a real space is ~0.25 em; kerning and rounding stay well below
@@ -277,11 +369,14 @@ def build_blocks(glyphs: list[Glyph], page_number: int) -> list[Block]:
         for seg in _split_segments(line):
             text_parts: list[str] = []
             runs: list[Run] = []
+            cx: list[tuple[float, float]] = []
             prev: Glyph | None = None
             for g in seg:
                 piece = g.ch
                 if prev is not None and _needs_space(prev, g):
                     piece = " " + piece
+                    cx.append((prev.box.right, g.box.x))
+                cx.extend([(g.box.x, g.box.right)] * len(g.ch))
                 style = glyph_style(g)
                 x0 = g.box.x
                 if runs and _style_key(runs[-1].style) == _style_key(style):
@@ -304,6 +399,9 @@ def build_blocks(glyphs: list[Glyph], page_number: int) -> list[Block]:
             text = "".join(r.text for r in runs)
             if not text.strip():
                 continue
+            full = "".join(text_parts)
+            lead = len(full) - len(full.lstrip())
+            char_x = cx[lead:lead + len(text)] if len(cx) == len(full) and full.strip() == text else None
             left = min(g.box.x for g in seg)
             top = min(g.box.y for g in seg)
             right = max(g.box.right for g in seg)
@@ -326,6 +424,7 @@ def build_blocks(glyphs: list[Glyph], page_number: int) -> list[Block]:
                 source="text",
                 style=dominant,
                 runs=runs,
+                char_x=char_x,
             )
             if any(g.unresolved_symbol for g in seg):
                 block.notes.append("含無法對應的私用區符號，輸出時可能顯示成空白或方框。")

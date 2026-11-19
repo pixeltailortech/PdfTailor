@@ -35,6 +35,7 @@ class Line:
     text: str
     parts: list[tuple[float, float]]  # x extent of each block that makes the line
     tab_before: list[int] = field(default_factory=list)  # indices into parts that follow a TAB
+    leader: bool = False  # a table-of-contents line: "title ........ 12", dots now a TAB
 
     @property
     def cy(self) -> float:
@@ -69,6 +70,9 @@ class Para:
     first_left: float = 0.0
     area_left: float = 0.0
     hang_exact: bool = False
+    # list item whose wrapped lines return to the left of its text (Word's numbered list
+    # with the number indented and the wrap flush with the paragraph): x of those lines
+    wrap_left: float | None = None
     marker_sep: str = " "
 
 
@@ -95,6 +99,7 @@ class Table:
     line_color: RGB = (0, 0, 0)
     left_indent: float = 0.0
     space_before: float = 0.0
+    header_rows: int = 0  # leading rows repeated at the top of every page the table spans
 
     @property
     def top(self) -> float:
@@ -117,12 +122,29 @@ class PageInput:
 
 
 @dataclass
+class HFLine:
+    """One line of a running header or footer (written into Word's header/footer)."""
+    runs: list[Run]
+    text: str
+    align: str  # left | center | right
+    top: float
+    bottom: float
+    x0: float
+    x1: float
+    tabs: list[tuple[float, str]] = field(default_factory=list)  # pt from the left margin
+    # a page number: (text before, Word number format, text after, value on this page)
+    page_num: tuple[str, str, str, int] | None = None
+
+
+@dataclass
 class PageDoc:
     page: int
     width: float
     height: float
     margins: tuple[float, float, float, float]  # left, top, right, bottom
     elements: list = field(default_factory=list)  # Para | Table
+    header: list[HFLine] = field(default_factory=list)
+    footer: list[HFLine] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- text helpers
@@ -220,6 +242,34 @@ def _copy_runs(b: Block) -> list[Run]:
     return [Run(r.text, r.style, r.x0, r.x1) for r in runs]
 
 
+# "第一章 緒論 ........ 1": four or more leader dots followed by a short page reference
+_LEADER_RE = re.compile(r"\s*[.．·…‧・⋯]{4,}[.．·…‧・⋯\s]*")
+_LEADER_TAIL_RE = re.compile(r"^\s*\S{1,8}\s*$")
+
+
+def _leader_to_tab(runs: list[Run]) -> bool:
+    """Replaces the dot leader of a contents line with a TAB; True when there was one."""
+    full = "".join(r.text for r in runs)
+    m = None
+    for m_ in _LEADER_RE.finditer(full):
+        m = m_
+    if m is None or m.start() == 0 or not _LEADER_TAIL_RE.match(full[m.end():]):
+        return False
+    a, b = m.start(), m.end()
+    pos = 0
+    first = True
+    for r in runs:
+        lo, hi = pos, pos + len(r.text)
+        pos = hi
+        if hi <= a or lo >= b:
+            continue
+        keep_l = r.text[: max(0, a - lo)]
+        keep_r = r.text[max(0, b - lo):]
+        r.text = keep_l + ("\t" if first else "") + keep_r
+        first = False
+    return True
+
+
 def make_line(row: list[Block], joiner: str = "\t") -> Line:
     runs: list[Run] = []
     parts: list[tuple[float, float]] = []
@@ -232,6 +282,7 @@ def make_line(row: list[Block], joiner: str = "\t") -> Line:
                 tab_before.append(i)
         runs.extend(_copy_runs(b))
         parts.append((b.bounds.x, b.bounds.right))
+    leader = _leader_to_tab(runs)
     text = "".join(r.text for r in runs)
     return Line(
         runs=runs,
@@ -244,6 +295,7 @@ def make_line(row: list[Block], joiner: str = "\t") -> Line:
         text=text,
         parts=parts,
         tab_before=tab_before,
+        leader=leader,
     )
 
 
@@ -289,7 +341,7 @@ def _usual_pitch(lines: list[Line]) -> float | None:
     return ps[int(0.4 * (len(ps) - 1))]
 
 
-def _starts_new(acc: _Acc, cur: Line, R: float, usual: float | None = None) -> bool:
+def _starts_new(acc: _Acc, cur: Line, R: float, usual: float | None = None, in_cell: bool = False) -> bool:
     prev = acc.lines[-1]
     size = max(prev.size, cur.size)
     pitch = cur.cy - prev.cy
@@ -299,13 +351,18 @@ def _starts_new(acc: _Acc, cur: Line, R: float, usual: float | None = None) -> b
     limit = 1.75 * size + 1.0
     if usual is not None:
         limit = max(limit, 1.3 * usual * size)
-    if pitch > limit or pitch < 0.55 * size:
+    # in a table cell a line that ran to the cell's right edge has wrapped, however loosely
+    # the rows are spaced (a 14 pt value on 28 pt rows)
+    wrapped = in_cell and R - prev.x1 <= 0.6 * size and pitch <= 2.4 * size
+    if (pitch > limit and not wrapped) or pitch < 0.55 * size:
         return True
     if abs(prev.size - cur.size) > max(0.6, 0.06 * size):
         return True
     if abs(prev.bold_frac - cur.bold_frac) > 0.8:
         return True
     if prev.tab_before or cur.tab_before:
+        return True
+    if prev.leader:  # a contents entry ends at its page number
         return True
     if match_marker(cur.text) is not None:
         return True
@@ -336,8 +393,8 @@ def build_paragraphs(lines: list[Line], L: float, R: float, in_cell: bool = Fals
     groups: list[_Acc] = []
     usual = _usual_pitch(lines)
     for ln in lines:
-        mk = match_marker(ln.text)
-        if groups and not _starts_new(groups[-1], ln, R, usual):
+        mk = None if ln.leader else match_marker(ln.text)  # "2.1 Title …… 3" is a contents entry
+        if groups and not _starts_new(groups[-1], ln, R, usual, in_cell):
             groups[-1].lines.append(ln)
         else:
             groups.append(_Acc([ln], mk))
@@ -351,6 +408,10 @@ def _squeeze_cjk_spaces(runs: list[Run]) -> None:
     drop: set[tuple[int, int]] = set()
     for i, ch in enumerate(flat):
         if ch == " " and 0 < i < len(flat) - 1 and _wide(flat[i - 1]) and _wide(flat[i + 1]):
+            # a space read from a real text layer was typed ("第一章 緒論"); only spaces
+            # guessed from gaps in a scan are artefacts
+            if runs[chars[i][0]].style.source == "font":
+                continue
             drop.add(chars[i])
     if not drop:
         return
@@ -434,19 +495,32 @@ def _finish(acc: _Acc, L: float, R: float, in_cell: bool) -> Para:
             else:
                 para.tabs.append((x0 - L, "left"))
 
+    if lines[-1].leader:  # contents entry: right-aligned page number after a dot leader
+        pos = lines[-1].x1 - L
+        para.tabs = [t for t in para.tabs if abs(t[0] - pos) > 2.0] + [(pos, "right-dot")]
+
     # list item: literal marker + TAB, hanging indent
-    if acc.marker is not None:
+    # a one-line cell ("11.75 小時", "1. 版面與對稱邊界") is text, not a list item
+    if acc.marker is not None and not (in_cell and len(lines) == 1):
         raw, norm = acc.marker
         r0 = runs[0]
         if r0.text.startswith(raw):
             tail = r0.text[len(raw):].lstrip()
             para.marker_sep = " " if r0.text[len(raw):][:1].isspace() else ""
             r0.text = norm + "\t" + tail
+            if not tail and len(runs) > 1:  # the marker is a run of its own: its space goes with the tab
+                runs[1].text = runs[1].text.lstrip()
             para.marker = norm
             para.text = "".join(r.text for r in runs)
+            wrap = None
             if len(lines) > 1 and lines[1].x0 > first.x0 + 0.5 * size:
                 text_x = lines[1].x0
                 para.hang_exact = True
+            elif len(lines) > 1 and first.tab_before and first.parts[0][1] - first.parts[0][0] < 4.5 * size:
+                text_x = first.parts[1][0]
+                para.hang_exact = True
+                para.tabs = [t for t in para.tabs if abs(t[0] - (text_x - L)) > 1]
+                wrap = lines[1].x0
             elif first.tab_before and first.parts[0][1] - first.parts[0][0] < 4.5 * size:
                 text_x = first.parts[1][0]
                 para.hang_exact = True
@@ -454,6 +528,10 @@ def _finish(acc: _Acc, L: float, R: float, in_cell: bool) -> Para:
             else:
                 width = sum(1.0 if _wide(ch) else 0.55 for ch in raw) * size
                 text_x = first.x0 + max(1.2 * size, width + 0.4 * size)
+                if len(lines) > 1:
+                    wrap = lines[1].x0
+            if wrap is not None and wrap < text_x - 0.5 * size:
+                para.wrap_left = wrap
             para.kind = "list"
             para.first_left = first.x0
             para.body_left = text_x
@@ -494,6 +572,23 @@ def _row_cy(row: list[Block]) -> float:
     return (t + b) / 2
 
 
+def _wraps_from(rows: list[list[Block]], k: int, start: int) -> bool:
+    """Is the single-block row ``k`` the wrapped second line of the value above it?
+
+    It starts where the value above starts, that value ran to (nearly) the right edge of
+    its column, and the lines are no further apart than a wrapped line plus paragraph gap.
+    """
+    cur, prev = rows[k], rows[k - 1]
+    if len(cur) != 1 or not prev:
+        return False
+    pb = prev[-1]
+    size = max(_row_size(prev), _row_size(cur))
+    if abs(cur[0].bounds.x - pb.bounds.x) > 4.0 or _row_cy(cur) - _row_cy(prev) > 2.6 * size:
+        return False
+    reach = max(r[-1].bounds.right for r in rows[start:k] if r)
+    return pb.bounds.right >= reach - 1.2 * size
+
+
 def detect_text_tables(rows: list[list[Block]], max_right: float = 1e9) -> list[tuple[int, int, Table]]:
     """Borderless tables: consecutive rows whose blocks line up in columns."""
     found: list[tuple[int, int, Table]] = []
@@ -517,7 +612,9 @@ def detect_text_tables(rows: list[list[Block]], max_right: float = 1e9) -> list[
                     break
                 end = k
             elif pitch > 1.7 * size:
-                break
+                if not _wraps_from(rows, k, i):
+                    break
+                end = k
             k += 1
         tbl, used_end = None, end
         while used_end > i:
@@ -562,7 +659,8 @@ def _build_text_table(rows: list[list[Block]], cols: list[tuple[float, float]], 
     n = len(cols)
     bounds_x = [cols[0][0] - 2.0]
     for a, b in zip(cols, cols[1:]):
-        bounds_x.append((a[1] + b[0]) / 2)
+        # the left column keeps most of the gap: Word's fonts run wider than the PDF's
+        bounds_x.append(b[0] - min(4.0, 0.5 * (b[0] - a[1])))
     bounds_x.append(max(cols[-1][1] + 2.0, min(cols[-1][1] + 16.0, max_right)))  # room for wider Word fonts
 
     def col_of(x: float) -> int:
@@ -576,6 +674,12 @@ def _build_text_table(rows: list[list[Block]], cols: list[tuple[float, float]], 
     row_top: list[float] = []
     row_bottom: list[float] = []
     prev_ext: tuple[float, float] | None = None
+    col_reach: dict[int, float] = {}
+    for r in rows:
+        for blk in r:
+            c0, c1 = col_of(blk.bounds.x + 0.5), col_of(blk.bounds.right - 0.5)
+            if c0 == c1:
+                col_reach[c0] = max(col_reach.get(c0, 0.0), blk.bounds.right)
     for r in rows:
         t, b = _row_extent(r)
         size = _row_size(r)
@@ -586,6 +690,14 @@ def _build_text_table(rows: list[list[Block]], cols: list[tuple[float, float]], 
             spans.append(((c0, c1), blk))
         tight = prev_ext is not None and (t + b) / 2 - (prev_ext[0] + prev_ext[1]) / 2 <= 1.35 * size
         cont = tight and len(r) < n and all(s[0][0] == s[0][1] for s in spans) and trows
+        if not cont and trows and len(r) == 1 and spans[0][0][0] == spans[0][0][1] and prev_ext is not None:
+            # a value that wrapped onto a second line, with the paragraph gap of the rows
+            key = spans[0][0]
+            above = trows[-1].get(key)
+            if above and (t + b) / 2 - (prev_ext[0] + prev_ext[1]) / 2 <= 2.6 * size \
+                    and abs(spans[0][1].bounds.x - above[-1].bounds.x) <= 4.0 \
+                    and above[-1].bounds.right >= col_reach[key[0]] - 1.2 * size:
+                cont = True
         if cont:
             for key, blk in spans:
                 trows[-1].setdefault(key, []).append(blk)
@@ -631,6 +743,14 @@ def _build_text_table(rows: list[list[Block]], cols: list[tuple[float, float]], 
             if c not in occupied:
                 cells.append(Cell(ri, c, 1, 1))
     cells.sort(key=lambda c: (c.r, c.c))
+    for ri in range(len(trows)):  # a wrapped value's line pitch also sets where its row-mates' first line sits
+        pitch = max((p.line_pitch for c in cells if c.r == ri for p in c.paras), default=0.0)
+        if pitch > 0:
+            for c in cells:
+                if c.r == ri:
+                    for p in c.paras:
+                        if p.line_pitch == 0:
+                            p.line_pitch = pitch
     # heights: pitch-to-pitch
     row_h = []
     for ri in range(len(trows)):
@@ -711,7 +831,185 @@ def _strip_rule_noise(b: Block) -> Block | None:
     runs[0].text = runs[0].text.lstrip(_RULE_CHARS)
     runs[-1].text = runs[-1].text.rstrip(_RULE_CHARS)
     text = "".join(r.text for r in runs)
-    return replace(b, text=text, runs=runs) if text.strip() else None
+    return replace(b, text=text, runs=runs, char_x=None) if text.strip() else None
+
+
+# --------------------------------------------------------------------------- cutting blocks
+
+def split_block(b: Block, cuts: list[float]) -> list[Block]:
+    """Splits a text-layer line at the given x positions (cell borders, a label's end).
+
+    Each character goes to the side its centre is on; the line is cut where that side
+    changes. Spaces next to a cut are dropped. Lines without per-character positions, or
+    not crossed by any cut, come back unchanged.
+    """
+    cx = b.char_x
+    if not cx or len(cx) != len(b.text) or not cuts:
+        return [b]
+    cuts = sorted(cuts)
+
+    def side(i: int) -> int:
+        mid = (cx[i][0] + cx[i][1]) / 2
+        return sum(1 for c in cuts if mid > c)
+
+    sides = [side(i) for i in range(len(b.text))]
+    vis = [i for i, ch in enumerate(b.text) if not ch.isspace()]
+    if not vis or len({sides[i] for i in vis}) < 2:
+        return [b]
+    groups: list[list[int]] = []
+    side_cur = None
+    for i in vis:
+        if side_cur is None or sides[i] != side_cur:
+            groups.append([])
+            side_cur = sides[i]
+        groups[-1].append(i)
+    flat = "".join(r.text for r in b.runs)
+    runs_ok = bool(b.runs) and flat == b.text
+    out: list[Block] = []
+    for g in groups:
+        a0, a1 = g[0], g[-1] + 1
+        text = b.text[a0:a1]
+        runs: list[Run] = []
+        if runs_ok:
+            pos = 0
+            for r in b.runs:
+                lo, hi = max(pos, a0), min(pos + len(r.text), a1)
+                if hi > lo:
+                    seg_cx = cx[lo:hi]
+                    runs.append(Run(r.text[lo - pos:hi - pos], r.style, min(c[0] for c in seg_cx), max(c[1] for c in seg_cx)))
+                pos += len(r.text)
+        style = max(runs, key=lambda r: len(r.text.strip())).style if runs else b.style
+        part_cx = cx[a0:a1]
+        x0 = min(c[0] for c in part_cx)
+        x1 = max(c[1] for c in part_cx)
+        out.append(replace(
+            b, text=text, runs=runs or [Run(text, style, x0, x1)], style=style,
+            bounds=Rect.from_bounds(x0, b.bounds.y, x1, b.bounds.bottom), char_x=list(part_cx),
+            notes=list(b.notes), detected_symbols=[],
+        ))
+    return out
+
+
+# a short label, its colon, then the value: "研 究 主 題： 台灣北部山城聚落…"
+_COLON = "：:"
+
+
+def _label_cut(b: Block) -> tuple[float, float] | None:
+    """(x just after the label's colon, x where the value starts) for a label/value line."""
+    cx = b.char_x
+    if not cx or len(cx) != len(b.text):
+        return None
+    t = b.text
+    k = next((i for i, ch in enumerate(t) if ch in _COLON), -1)
+    if k < 1:
+        return None
+    label = t[:k]
+    if not 1 <= len(re.sub(r"\s+", "", label)) <= 8 or re.sub(r"\s+", "", label).isdigit():
+        return None
+    j = k + 1
+    while j < len(t) and t[j].isspace():
+        j += 1
+    if j >= len(t):
+        return None
+    return cx[k][1], cx[j][0]
+
+
+_SPREAD_RE = re.compile(r"(?:\S[ \u3000])+\S[：:]?")
+
+
+def _spread_label(b: Block) -> list[int] | None:
+    """Indices of the characters of a letter-spaced label ("研 究 主 題："), else None."""
+    t = b.text
+    if not b.char_x or len(b.char_x) != len(t) or not b.runs or not _SPREAD_RE.fullmatch(t):
+        return None
+    vis = [i for i, ch in enumerate(t) if not ch.isspace()]
+    body = [i for i in vis if t[i] not in _COLON]
+    if len(body) < 2 or not all(_wide(t[i]) for i in body):
+        return None
+    return vis
+
+
+def _tighten_label(b: Block, extra: float, x0: float) -> Block:
+    """"研 究 主 題：" → "研究主題：" with the gaps as character spacing, starting at ``x0``.
+
+    A typed space is as wide as the substitute font says (half an em or more in 標楷體),
+    which made the label wider than its PDF column and wrapped it in Word; character
+    spacing is the same in every font. The colon stays out of it, so no spacing trails.
+    """
+    vis = _spread_label(b)
+    if vis is None:
+        return b
+    t, cx = b.text, b.char_x
+    base = max(b.runs, key=lambda r: len(r.text.strip())).style
+    body = [i for i in vis if t[i] not in _COLON]
+    runs = [Run("".join(t[i] for i in body), base.with_(spacing=round(extra, 1)), cx[body[0]][0], cx[body[-1]][1])]
+    if len(vis) > len(body):
+        k = vis[-1]
+        runs.append(Run(t[k], base, cx[k][0], cx[k][1]))
+    text = "".join(r.text for r in runs)
+    x1 = b.bounds.x + b.bounds.w
+    return replace(b, text=text, runs=runs, style=base, char_x=None,
+                   bounds=Rect.from_bounds(min(x0, b.bounds.x), b.bounds.y, x1, b.bounds.bottom))
+
+
+def _split_label_values(blocks: list[Block]) -> list[Block]:
+    """Cuts the label off every line of a column of "label：value" lines.
+
+    Only when at least two lines of the same size line up — the same label start and the
+    same value start; a single "註：…" line in running text stays whole.
+    """
+    cand: list[tuple[Block, float, float]] = []
+    for b in blocks:
+        cut = _label_cut(b)
+        if cut is not None:
+            k = next(i for i, ch in enumerate(b.text) if ch in _COLON)
+            j = k + 1
+            while b.text[j].isspace():
+                j += 1
+            cand.append((b, cut[0], b.char_x[j][0]))
+    # labels that already stand alone ("作者姓名：" with its value in another block) vouch
+    # for a line whose label and value ran together
+    alone = [(m, m.bounds.x + m.bounds.w) for m in blocks
+             if m.text.strip()[-1:] in _COLON and len(re.sub(r"\s+", "", m.text)) <= 9]
+    if not cand or len(cand) + len(alone) < 2:
+        return blocks
+    chosen: set[int] = set()
+    for b, end, vx in cand:
+        # labels set to one width end their colons on one x; ragged labels start their
+        # values on one x (glyph ink makes that wobble by a few points)
+        mates = [m for m, me, mvx in cand if m is not b and (abs(me - end) <= 4.0 or abs(mvx - vx) <= 8.0)
+                 and abs(m.bounds.x - b.bounds.x) <= 12.0 and abs(m.style.size - b.style.size) <= 0.5]
+        mates += [m for m, me in alone if m is not b and abs(m.bounds.x - b.bounds.x) <= 12.0 and abs(m.style.size - b.style.size) <= 0.5]
+        if mates:
+            chosen.add(id(b))
+    if not chosen:
+        return blocks
+    alone_ids = {id(m) for m, _ in alone}
+    out: list[Block] = []
+    labels: list[int] = []  # positions in ``out`` of the label blocks
+    for b in blocks:
+        if id(b) in chosen:
+            end = _label_cut(b)
+            parts = split_block(b, [(end[0] + end[1]) / 2])
+            labels.append(len(out))
+            out.extend(parts)
+        else:
+            if id(b) in alone_ids:
+                labels.append(len(out))
+            out.append(b)
+    # letter-spaced labels share one pitch that fills the label column exactly
+    spread = [(k, _spread_label(out[k])) for k in labels]
+    spread = [(k, v) for k, v in spread if v is not None]
+    if spread:
+        vx = sorted(v for _, _, v in cand)[len(cand) // 2]
+        x0 = min(out[k].bounds.x for k, _ in spread)
+        size = out[spread[0][0]].style.size
+        n = max(len(v) for _, v in spread)
+        avail = vx - x0 - 12.0
+        extra = min(max(0.0, (avail - n * size) / max(1, n - 1)), 1.2 * size)
+        for k, _ in spread:
+            out[k] = _tighten_label(out[k], extra, x0)
+    return out
 
 
 def build_ruled_table(g: Grid, blocks: list[Block], rgb: np.ndarray | None, scale: float) -> tuple[Table, list[Block]]:
@@ -735,12 +1033,23 @@ def build_ruled_table(g: Grid, blocks: list[Block], rgb: np.ndarray | None, scal
                 best, best_d = i, d
         return best
 
+    def row_of(py: float) -> int:
+        for r in range(g.rows):
+            if g.ys[r] <= py <= g.ys[r + 1]:
+                return r
+        return min(range(g.rows), key=lambda r: min(abs(py - g.ys[r]), abs(py - g.ys[r + 1])))
+
     for b in blocks:
         if inner.contains_point(b.bounds.cx, b.bounds.cy):
             used.append(b)
-            clean = _strip_rule_noise(b)
-            if clean is not None:
-                by_cell[locate(b.bounds.cx, b.bounds.cy)].append(clean)
+            # A line the text layer ran across two cells ("時段區間 空間節點") is cut at every
+            # rule that separates them in this row; cells merged across a missing rule stay whole.
+            r = row_of(b.bounds.cy)
+            cuts = [g.xs[c + 1] for c in range(g.cols - 1) if g.vsep[r][c]]
+            for piece in split_block(b, cuts):
+                clean = _strip_rule_noise(piece)
+                if clean is not None:
+                    by_cell[locate(clean.bounds.cx, clean.bounds.cy)].append(clean)
 
     for i, (r, c, rs, cs) in enumerate(rects):
         x0, x1, y0, y1 = g.xs[c], g.xs[c + cs], g.ys[r], g.ys[r + rs]
@@ -835,7 +1144,13 @@ def _align(paras: list[Para], L: float, R: float, cell: bool = False, page_cx: f
                 elif delta < -1.0:
                     p.right_indent = -2 * delta
             continue
-        if p.kind == "list":
+        if p.kind == "list" and p.wrap_left is not None:
+            # marker indented, wrapped lines flush further left: a first-line indent plus a
+            # tab stop where the item's text starts
+            p.left_indent = max(0.0, p.wrap_left - L)
+            p.first_line = p.first_left - max(p.wrap_left, L)
+            p.tabs = [t for t in p.tabs if abs(t[0] - (p.body_left - L)) > 1] + [(p.body_left - L, "left")]
+        elif p.kind == "list":
             p.left_indent = max(0.0, p.body_left - L)
             p.first_line = -(p.body_left - p.first_left)
         else:
@@ -863,9 +1178,11 @@ def _harmonize_lists(paras: list[Para]) -> None:
         exact = [p.body_left for p in grp if p.hang_exact]
         src = exact or [p.body_left for p in grp]
         x = float(np.median(src))
+        wraps = [p.wrap_left for p in grp if p.wrap_left is not None]
         for p in grp:
             p.body_left = x
             p.first_left = float(np.median([q.first_left for q in grp]))
+            p.wrap_left = float(np.median(wraps)) if wraps else None
         i = j + 1
 
 
@@ -877,7 +1194,16 @@ def _spacing(paras: list[Para]) -> None:
         # next paragraph's first line, so the previous paragraph's own height must be removed
         last_cy = a.bottom - a.size * 0.5
         first_cy = b.top + b.size * 0.5
-        extra = (first_cy - last_cy) - 1.25 * max(a.size, b.size)
+        d = first_cy - last_cy
+        size = max(a.size, b.size)
+        # Word gives a line of a multi-line paragraph its full line spacing, so that much
+        # of the distance is already there; a one-line paragraph between lines set at the
+        # same spacing (a short list item) takes that spacing instead of a space before.
+        if b.line_pitch <= 0 and a.line_pitch > 0 and abs(a.size - b.size) <= 0.06 * size \
+                and 0.85 * a.line_pitch <= d <= 1.15 * a.line_pitch:
+            b.line_pitch = a.line_pitch
+        line_h = max(b.line_pitch, 1.25 * size) if b.line_pitch > 0 else 1.25 * size
+        extra = d - line_h
         b.space_before = extra if extra >= 2.0 else 0.0
         b.space_before = min(b.space_before, 48.0)
 
@@ -911,6 +1237,7 @@ def _page_chunks(page: PageInput) -> tuple[list, tuple[float, float, float, floa
         tables.append(t)
         taken.update(id(b) for b in used)
     free = [b for b in page.blocks if id(b) not in taken and b.text.strip()]
+    free = _split_label_values(free)
 
     rows = group_rows(free)
     consumed = [False] * len(rows)
@@ -964,7 +1291,7 @@ def _page_chunks(page: PageInput) -> tuple[list, tuple[float, float, float, floa
                 if p.left_indent < 0.6 * p.size:
                     p.left_indent = 0.0
             if p.kind == "list":
-                p.left_indent = max(0.0, p.body_left - L_area)
+                p.left_indent = max(0.0, (p.wrap_left if p.wrap_left is not None else p.body_left) - L_area)
         elements.extend(paras)
         buf.clear()
 
@@ -1009,6 +1336,19 @@ def _outer_grids(grids: list[Grid]) -> list[Grid]:
 
 # --------------------------------------------------------------------------- document level
 
+# "研 究 主 題：台灣北部…", "作者姓名：王大明", "關鍵詞：…": a short label, a colon, then the
+# value. Set larger than the body on a cover page, but a field line, not a heading.
+_LABEL_RE = re.compile(r"^\s*([^：:\n]{1,16}?)\s*[：:]\s*(\S.*)$")
+
+
+def _is_label_line(text: str) -> bool:
+    m = _LABEL_RE.match(text)
+    if m is None:
+        return False
+    label = re.sub(r"\s+", "", m.group(1))
+    return 1 <= len(label) <= 8 and not label.isdigit()
+
+
 def _classify(pages: list[PageDoc]) -> None:
     free: list[Para] = [e for p in pages for e in p.elements if isinstance(e, Para)]
     pool = free or [q for p in pages for e in p.elements if isinstance(e, Table)
@@ -1022,10 +1362,17 @@ def _classify(pages: list[PageDoc]) -> None:
     body_bold = sum(len(q.text) * q.bold_frac for q in pool) / max(1, sum(len(q.text) for q in pool))
 
     cands: list[Para] = []
+    label_size: float | None = None  # size of the label line just before this paragraph
     for p in free:
+        t = p.text.strip()
+        is_label = _is_label_line(t)
+        # a value that wrapped onto the next line ("…空間動線與時 / 間配置") belongs to it
+        wrapped = label_size is not None and not is_label and abs(label_size - p.size) <= 0.5
+        label_size = p.size if is_label else None
+        if is_label or wrapped:
+            continue
         if p.kind == "list" and not _HEAD_NUM_RE.match(p.text):
             continue
-        t = p.text.strip()
         n = len(t)
         wide = sum(_wide(ch) for ch in t) * 2 >= max(1, n)
         if n == 0 or n > (40 if wide else 90) or p.n_lines > 2 or p.tabs:
@@ -1082,10 +1429,203 @@ def _classify(pages: list[PageDoc]) -> None:
         # centred / right-aligned headings keep the indents _align gave them
 
 
+# --------------------------------------------------------------------------- running headers / footers
+
+_ROMAN = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
+_PAGE_NUM_RE = re.compile(
+    r"^(?P<pre>\s*(?:第|page|p\.|[-–—])?\s*)"
+    r"(?P<num>\d{1,4}|[ivxlcdm]{1,8}|[IVXLCDM]{1,8})"
+    r"(?P<post>\s*(?:頁|[-–—])?\s*(?:(?:/|of|共)\s*\d{1,4}\s*頁?)?\s*)$",
+    re.I,
+)
+# fraction of the page height that counts as the header / footer band
+_BAND = 0.12
+
+
+def _roman_value(t: str) -> int | None:
+    t = t.lower()
+    total = 0
+    for i, ch in enumerate(t):
+        v = _ROMAN[ch]
+        nxt = _ROMAN[t[i + 1]] if i + 1 < len(t) else 0
+        total += -v if v < nxt else v
+    # only canonical numerals ("iv", not "iiii"), and not ordinary words such as "mix"
+    back = ""
+    n = total
+    for val, sym in ((1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"),
+                     (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")):
+        while n >= val:
+            back += sym
+            n -= val
+    return total if back == t and 0 < total < 400 else None
+
+
+def page_number_of(text: str) -> tuple[str, str, str, int] | None:
+    """``"- 3 -"`` -> ("- ", "decimal", " -", 3); ``"ii"`` -> ("", "lowerRoman", "", 2)."""
+    m = _PAGE_NUM_RE.match(text)
+    if m is None:
+        return None
+    num = m.group("num")
+    if num.isdigit():
+        fmt, val = "decimal", int(num)
+    else:
+        v = _roman_value(num)
+        if v is None or (num != num.lower() and num != num.upper()):
+            return None
+        fmt, val = ("lowerRoman" if num.islower() else "upperRoman"), v
+    return m.group("pre").lstrip(), fmt, m.group("post").rstrip(), val
+
+
+def _hf_key(text: str) -> str:
+    return re.sub(r"\d+", "#", re.sub(r"\s+", "", text))
+
+
+def _band_rows(pg: PageInput, top: bool) -> list[list[Block]]:
+    """The rows at the very top (or bottom) of the page that sit inside the band."""
+    rows = group_rows([b for b in pg.blocks if b.text.strip()])
+    if len(rows) < 2:
+        return []
+    boxes = [g.bounds for g in pg.grids]
+
+    def in_grid(row: list[Block]) -> bool:
+        return any(b.bounds.x < gb.right and b.bounds.right > gb.x and b.bounds.y < gb.bottom and b.bounds.bottom > gb.y
+                   for b in row for gb in boxes)
+
+    out: list[list[Block]] = []
+    seq = rows if top else rows[::-1]
+    for r in seq[:2]:
+        y0, y1 = _row_extent(r)
+        inside = y1 <= pg.height * _BAND if top else y0 >= pg.height * (1 - _BAND)
+        if not inside or in_grid(r) or len("".join(b.text for b in r)) > 90:
+            break
+        out.append(r)
+    return out
+
+
+def _hf_line(row: list[Block], width: float) -> HFLine:
+    ln = make_line(row)
+    cx = (ln.x0 + ln.x1) / 2
+    if len(row) == 1 and abs(cx - width / 2) < 0.06 * width:
+        align = "center"
+    elif len(row) == 1 and ln.x0 > width * 0.5:
+        align = "right"
+    else:
+        align = "left"
+    hf = HFLine(ln.runs, ln.text, align, ln.top, ln.bottom, ln.x0, ln.x1)
+    if len(row) > 1:  # "left part<TAB>right part": positions are fixed later against the margins
+        hf.tabs = [(b.bounds.right if i == len(row) - 1 else b.bounds.x, "right" if i == len(row) - 1 else "left")
+                   for i, b in enumerate(row) if i > 0]
+    hf.page_num = page_number_of(ln.text) if len(row) == 1 else None
+    return hf
+
+
+def split_running(inputs: list[PageInput]) -> tuple[list[PageInput], dict[int, tuple[list[HFLine], list[HFLine]]]]:
+    """Takes running headers, footers and page numbers out of the page bodies.
+
+    A band row counts when it is a page number ("3", "ii", "- 3 -", "第 3 頁"), or when the
+    same text (digits ignored) sits in the same band on at least two pages. Word gets them
+    back as its own header and footer, so they do not end up as body paragraphs.
+    """
+    n = len(inputs)
+    seen: dict[tuple[bool, str], int] = {}
+    cands: dict[int, list[tuple[bool, list[Block]]]] = {}
+    for pg in inputs:
+        lst = []
+        for top in (True, False):
+            for r in _band_rows(pg, top):
+                key = _hf_key("".join(b.text for b in r))
+                seen[(top, key)] = seen.get((top, key), 0) + 1
+                lst.append((top, r))
+        cands[pg.page] = lst
+    need = 2 if n <= 6 else max(2, int(0.3 * n))
+    # running heads are set no larger than the body text; a page title in the same place on
+    # every page ("Inspection plan 2", "Inspection plan 3") is set bigger and stays in the body
+    weight: Counter = Counter()
+    for pg in inputs:
+        for b in pg.blocks:
+            weight[round(b.style.size * 2) / 2] += len(b.text.strip())
+    body = weight.most_common(1)[0][0] if weight else 10.5
+    out_inputs: list[PageInput] = []
+    hf: dict[int, tuple[list[HFLine], list[HFLine]]] = {}
+    for pg in inputs:
+        head: list[HFLine] = []
+        foot: list[HFLine] = []
+        taken: set[int] = set()
+        for top, r in cands[pg.page]:
+            text = "".join(b.text for b in r)
+            if not (len(r) == 1 and page_number_of(text)):
+                if seen[(top, _hf_key(text))] < need:
+                    continue
+                if max(b.style.size for b in r) > 1.05 * body:
+                    continue
+            (head if top else foot).append(_hf_line(r, pg.width))
+            taken.update(id(b) for b in r)
+        head.sort(key=lambda h: h.top)
+        foot.sort(key=lambda h: h.top)
+        hf[pg.page] = (head, foot)
+        out_inputs.append(replace(pg, blocks=[b for b in pg.blocks if id(b) not in taken]) if taken else pg)
+    return out_inputs, hf
+
+
+def _row_texts(t: Table, r: int) -> list[str]:
+    cells = sorted((c for c in t.cells if c.r == r), key=lambda c: c.c)
+    return [re.sub(r"\s+", "", "".join(p.text for p in c.paras)) for c in cells]
+
+
+def _continues(a: PageDoc, b: PageDoc) -> bool:
+    """True when the last table of page ``a`` carries on as the first table of page ``b``."""
+    if not a.elements or not b.elements:
+        return False
+    ta, tb = a.elements[-1], b.elements[0]
+    if not (isinstance(ta, Table) and isinstance(tb, Table) and ta.ruled and tb.ruled):
+        return False
+    if abs(a.width - b.width) > 2 or abs(a.height - b.height) > 2:
+        return False
+    if len(ta.col_w) != len(tb.col_w) or any(abs(x - y) > max(3.0, 0.03 * x) for x, y in zip(ta.col_w, tb.col_w)):
+        return False
+    # it has to run into the foot of one page and start at the head of the next
+    return ta.bottom >= a.height - a.margins[3] - 0.08 * a.height and tb.top <= b.margins[1] + 0.08 * b.height
+
+
+def _merge_continued_tables(docs: list[PageDoc]) -> list[PageDoc]:
+    """Joins a table the PDF broke at a page boundary back into one table.
+
+    The continuation page's remaining content follows in the same Word section, so the
+    table flows across the break by itself and a repeated header row becomes a real
+    "repeat header" row instead of a second copy of the text.
+    """
+    out: list[PageDoc] = []
+    for pg in docs:
+        if out and _continues(out[-1], pg):
+            host = out[-1]
+            ta, tb = host.elements[-1], pg.elements[0]
+            base = len(ta.row_h)
+            rows_b = list(tb.row_h)
+            cells_b = list(tb.cells)
+            if base and tb.row_h and _row_texts(ta, 0) == _row_texts(tb, 0) and any(_row_texts(tb, 0)) \
+                    and all(c.rs == 1 for c in cells_b if c.r == 0):
+                cells_b = [c for c in cells_b if c.r != 0]
+                for c in cells_b:
+                    c.r -= 1
+                rows_b = rows_b[1:]
+                ta.header_rows = max(ta.header_rows, 1)
+            for c in cells_b:
+                c.r += base
+            ta.cells.extend(cells_b)
+            ta.row_h.extend(rows_b)
+            host.elements.extend(pg.elements[1:])
+            continue
+        out.append(pg)
+    return out
+
+
 def structure_document(inputs: list[PageInput]) -> list[PageDoc]:
+    inputs, hf = split_running(inputs)
     docs: list[PageDoc] = []
     for pg in inputs:
         els, margins = _page_chunks(pg)
-        docs.append(PageDoc(pg.page, pg.width, pg.height, margins, els))
+        head, foot = hf.get(pg.page, ([], []))
+        docs.append(PageDoc(pg.page, pg.width, pg.height, margins, els, head, foot))
+    docs = _merge_continued_tables(docs)
     _classify(docs)
     return docs

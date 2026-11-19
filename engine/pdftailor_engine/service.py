@@ -596,7 +596,7 @@ class Session:
             if not e.text.strip():
                 continue  # deleted in the editor
             runs = e.runs if e.runs and "".join(r.text for r in e.runs) == e.text else [Run(e.text, e.style, e.bounds.x, e.bounds.right)]
-            out.append(replace(b, text=e.text, runs=runs, style=e.style, bounds=e.bounds))
+            out.append(replace(b, text=e.text, runs=runs, style=e.style, bounds=e.bounds, char_x=None))
         return out
 
     def fonts_list(self) -> dict[str, Any]:

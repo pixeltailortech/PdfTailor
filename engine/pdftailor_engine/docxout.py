@@ -8,17 +8,18 @@ import re
 from docx import Document
 from docx.enum.section import WD_SECTION
 from docx.enum.table import WD_ROW_HEIGHT_RULE, WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, WD_TAB_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, WD_TAB_ALIGNMENT, WD_TAB_LEADER
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor
 
-from .docstruct import Cell, PageDoc, Para, Table, _wide
+from .docstruct import Cell, HFLine, PageDoc, Para, Table, _hf_key, _wide
 from .models import Run
 
 _BAD_XML = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]")
 CJK_DEFAULT = "Microsoft JhengHei"
 LATIN_DEFAULT = "Calibri"
+_SYMBOL_FONTS = {"Symbol", "Wingdings", "Wingdings 2", "Wingdings 3", "Webdings"}
 
 
 def _clean(t: str) -> str:
@@ -51,12 +52,24 @@ def _add_run(par, r: Run, force_color: bool = False) -> None:
         return
     run = par.add_run(text)
     st = r.style
-    _set_fonts(run, st.family, text, st.latin_family)
+    family, latin = st.family, st.latin_family
+    if (family in _SYMBOL_FONTS or latin in _SYMBOL_FONTS) and not any(0xE000 <= ord(ch) <= 0xF8FF for ch in text):
+        # a bullet read out of Symbol/Wingdings is now an ordinary Unicode character (•, ■,
+        # ✓); named in the symbol font Word shows an empty box, in a text font it falls back
+        # to whichever installed font has the glyph
+        family = latin = LATIN_DEFAULT if family in _SYMBOL_FONTS else family
+        if latin in _SYMBOL_FONTS:
+            latin = None
+    _set_fonts(run, family, text, latin)
     run.font.size = Pt(_half(st.size))
     if st.bold:
         run.font.bold = True
     elif force_color:  # a heading style is bold; the source heading is not
         run.font.bold = False
+    if st.spacing > 0.05:
+        sp = OxmlElement("w:spacing")
+        sp.set(qn("w:val"), str(int(round(st.spacing * 20))))
+        run._r.get_or_add_rPr().append(sp)
     if st.italic:
         run.font.italic = True
     elif force_color:  # Word's Heading 4 is italic; the source text is not
@@ -82,10 +95,19 @@ def _format(par, p: Para, heading: bool = False) -> None:
         pf.right_indent = Pt(round(p.right_indent, 1))
     if abs(p.first_line) > 0.5:
         pf.first_line_indent = Pt(round(p.first_line, 1))
-    for pos, kind in p.tabs:
-        if pos > 0:
-            pf.tab_stops.add_tab_stop(Pt(round(pos, 1)), WD_TAB_ALIGNMENT.RIGHT if kind == "right" else WD_TAB_ALIGNMENT.LEFT)
+    _tabs(pf, p.tabs)
     pf.widow_control = False
+
+
+def _tabs(pf, tabs) -> None:
+    for pos, kind in tabs:
+        if pos <= 0:
+            continue
+        if kind == "right-dot":
+            pf.tab_stops.add_tab_stop(Pt(round(pos, 1)), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS)
+        else:
+            align = {"right": WD_TAB_ALIGNMENT.RIGHT, "center": WD_TAB_ALIGNMENT.CENTER}.get(kind, WD_TAB_ALIGNMENT.LEFT)
+            pf.tab_stops.add_tab_stop(Pt(round(pos, 1)), align)
 
 
 def _write_para(doc_or_cell, p: Para, par=None):
@@ -207,6 +229,9 @@ def _write_table(doc, t: Table) -> None:
         if h > 0:
             row.height = Pt(round(h, 1))
             row.height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
+        if ri < t.header_rows:
+            trPr = row._tr.get_or_add_trPr()
+            trPr.append(OxmlElement("w:tblHeader"))
         for ci, w in enumerate(t.col_w):
             tbl.cell(ri, ci).width = Pt(round(w, 1))
 
@@ -262,8 +287,84 @@ def _style_headings(doc) -> None:
                 if fonts.get(qn(attr)) is not None:
                     del fonts.attrib[qn(attr)]
         st.paragraph_format.keep_with_next = False
+        # Word's built-in headings also keep their lines together: shown as a black square
+        # beside every heading, and pages break differently from the PDF
+        st.paragraph_format.keep_together = False
         st.paragraph_format.space_before = Pt(0)
         st.paragraph_format.space_after = Pt(0)
+
+
+def _field(par, instr: str, shown: str, r: Run) -> None:
+    """A Word field (PAGE) whose cached result is ``shown`` until Word updates it."""
+    def piece(kind: str | None = None, text: str | None = None, code: str | None = None):
+        run = par.add_run()
+        _set_fonts(run, r.style.family, shown, r.style.latin_family)
+        run.font.size = Pt(_half(r.style.size))
+        if kind:
+            fc = OxmlElement("w:fldChar")
+            fc.set(qn("w:fldCharType"), kind)
+            run._r.append(fc)
+        if code:
+            it = OxmlElement("w:instrText")
+            it.set(qn("xml:space"), "preserve")
+            it.text = code
+            run._r.append(it)
+        if text:
+            run.text = text
+    piece("begin")
+    piece(code=f" {instr} ")
+    piece("separate")
+    piece(text=shown)
+    piece("end")
+
+
+def _hf_signature(lines: list[HFLine]) -> tuple:
+    return tuple((h.align, _hf_key(h.text) if h.page_num is None else ("#", h.page_num[1]),
+                  tuple(round(t[0]) for t in h.tabs)) for h in lines)
+
+
+def _write_hf(part, lines: list[HFLine], left: float) -> None:
+    pars = list(part.paragraphs)
+    for i, h in enumerate(lines):
+        par = pars[0] if i == 0 and pars else part.add_paragraph()
+        pf = par.paragraph_format
+        pf.space_before = Pt(0)
+        pf.space_after = Pt(0)
+        pf.alignment = {"center": WD_ALIGN_PARAGRAPH.CENTER, "right": WD_ALIGN_PARAGRAPH.RIGHT}.get(h.align, WD_ALIGN_PARAGRAPH.LEFT)
+        if h.align == "left" and h.x0 - left > 6:
+            pf.left_indent = Pt(round(h.x0 - left, 1))
+        _tabs(pf, [(x - left, kind) for x, kind in h.tabs])
+        runs = [r for r in h.runs if r.text]
+        if h.page_num is not None and runs:
+            pre, _fmt, post, value = h.page_num
+            st = runs[0]
+            if pre:
+                _add_run(par, Run(pre, st.style, 0, 0))
+            _field(par, "PAGE", h.text.strip()[len(pre):len(h.text.strip()) - len(post)] or str(value), st)
+            if post:
+                _add_run(par, Run(post, st.style, 0, 0))
+        else:
+            for r in runs:
+                _add_run(par, r)
+
+
+def _page_numbering(sec, fmt: str, start: int) -> None:
+    sectPr = sec._sectPr
+    for e in sectPr.findall(qn("w:pgNumType")):
+        sectPr.remove(e)
+    e = OxmlElement("w:pgNumType")
+    e.set(qn("w:fmt"), fmt)
+    e.set(qn("w:start"), str(start))
+    # schema order: pgNumType comes after pgMar/paperSrc/pgBorders/lnNumType
+    anchor = None
+    for tag in ("w:lnNumType", "w:pgBorders", "w:paperSrc", "w:pgMar", "w:pgSz"):
+        anchor = sectPr.find(qn(tag))
+        if anchor is not None:
+            break
+    if anchor is not None:
+        anchor.addnext(e)
+    else:
+        sectPr.append(e)
 
 
 def write_docx(pages: list[PageDoc], out_path: str, title: str | None = None) -> dict:
@@ -275,7 +376,8 @@ def write_docx(pages: list[PageDoc], out_path: str, title: str | None = None) ->
     if title:
         doc.core_properties.title = title
 
-    stats = {"paragraphs": 0, "headings": 0, "lists": 0, "tables": 0}
+    stats = {"paragraphs": 0, "headings": 0, "lists": 0, "tables": 0, "headers": 0, "footers": 0}
+    prev_sig: dict[str, tuple] = {"header": (), "footer": ()}
     for i, pg in enumerate(pages):
         if i == 0:
             sec = doc.sections[0]
@@ -293,6 +395,24 @@ def write_docx(pages: list[PageDoc], out_path: str, title: str | None = None) ->
         sec.right_margin, sec.bottom_margin = Pt(round(r, 1)), Pt(round(b, 1))
         sec.header_distance = Pt(min(36.0, t / 2))
         sec.footer_distance = Pt(min(36.0, b / 2))
+        if pg.header:
+            sec.header_distance = Pt(round(max(4.0, min(pg.header[0].top, t - 4.0)), 1))
+        if pg.footer:
+            sec.footer_distance = Pt(round(max(4.0, pg.height - pg.footer[-1].bottom), 1))
+        for kind, lines in (("header", pg.header), ("footer", pg.footer)):
+            sig = _hf_signature(lines)
+            if i > 0 and sig == prev_sig[kind]:
+                continue  # same as the page before: stays linked to the previous section
+            part = sec.header if kind == "header" else sec.footer
+            if i > 0 or lines:
+                part.is_linked_to_previous = False
+            if lines:
+                _write_hf(part, lines, l)
+                stats[kind + "s"] += 1
+            prev_sig[kind] = sig
+        nums = [h.page_num for h in pg.header + pg.footer if h.page_num is not None]
+        if nums:
+            _page_numbering(sec, nums[0][1], nums[0][3])
 
         last_table = False
         for el in pg.elements:

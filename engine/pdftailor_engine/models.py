@@ -33,6 +33,7 @@ class TextStyle:
     source: str = "default"
     bold_confidence: float = 1.0
     italic_confidence: float = 1.0
+    spacing: float = 0.0  # extra pt after every character (a distributed label); not serialised
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -112,6 +113,10 @@ class Block:
     # geometric symbol detector; lets the UI mark them as "detected shape".
     detected_symbols: list[int] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # (left, right) of every character of ``text`` in display space, for blocks read from a
+    # real text layer; lets a table grid cut a line that runs across two cells. Not sent to
+    # the shell, and dropped whenever the text changes.
+    char_x: list[tuple[float, float]] | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
